@@ -57,6 +57,27 @@ const multer = require('multer');
 // 引入 axios：用于发送 HTTP 请求到 SiliconFlow API
 const axios = require('axios');
 
+// 引入 better-sqlite3：本地历史记录
+const Database = require('better-sqlite3');
+const db = new Database(path.join(__dirname, 'history.db'));
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_name TEXT,
+    chinese_text TEXT,
+    japanese_text TEXT,
+    image_urls TEXT,
+    prompts_json TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`).run();
+
+const insertHistory = db.prepare(`
+  INSERT INTO history (product_name, chinese_text, japanese_text, image_urls, prompts_json)
+  VALUES (?, ?, ?, ?, ?)
+`);
+
 // 调用 express() 创建应用实例
 const app = express();
 // 解析 JSON 请求体（生图接口需要）
@@ -124,6 +145,17 @@ const upload = multer({
 // ========== 路由：GET /test（兼容旧链接，重定向到首页） ==========
 app.get('/test', function (req, res) {
   res.redirect(302, '/');
+});
+
+// ========== 路由：GET /api/history 获取生图历史记录 ==========
+app.get('/api/history', function (req, res) {
+  try {
+    const rows = db.prepare('SELECT * FROM history ORDER BY created_at DESC LIMIT 20').all();
+    res.json(rows);
+  } catch (err) {
+    console.error('获取历史记录失败:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ========== 路由：/analyze-product ==========
@@ -517,9 +549,24 @@ ${japaneseText}`;
       })(),
     ];
 
+    const payload = results.map((r) => ({ url: r.url, prompt: r.prompt, error: r.error || undefined }));
+    const productName = (req.body && (req.body.product_name ?? req.body.productName)) ? String(req.body.product_name || req.body.productName).trim() : '';
+    const chineseText = (req.body && req.body.chineseText != null) ? String(req.body.chineseText).trim() : '';
+    try {
+      insertHistory.run(
+        productName,
+        chineseText,
+        japaneseText,
+        JSON.stringify(payload.map((r) => r.url)),
+        JSON.stringify(payload.map((r) => r.prompt))
+      );
+    } catch (dbErr) {
+      console.error('写入历史记录失败:', dbErr.message);
+    }
+
     res.json({
       success: true,
-      data: results.map((r) => ({ url: r.url, prompt: r.prompt, error: r.error || undefined })),
+      data: payload,
     });
   } catch (err) {
     const detail = err.response?.data?.message || err.response?.data?.error || err.message;

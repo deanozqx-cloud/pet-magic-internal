@@ -13,16 +13,37 @@
       .card-image-loading .progress-bar { width: 80%; max-width: 200px; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; overflow: hidden; }
       .card-image-loading .progress-bar-inner { height: 100%; background: linear-gradient(90deg, rgb(99 102 241), rgb(34 211 238)); border-radius: 3px; animation: card-progress 1.5s ease-in-out infinite; }
       @keyframes card-progress { 0% { width: 20%; margin-left: 0; } 50% { width: 60%; margin-left: 20%; } 100% { width: 20%; margin-left: 80%; } }
+      #historySidebar { transition: transform 0.2s ease; transform: translateX(0); }
+      #historySidebar.hidden { transform: translateX(-100%); }
+      #historyOverlay.hidden { pointer-events: none; opacity: 0; }
     </style>
   </head>
   <body class="min-h-screen bg-slate-950 text-slate-100 antialiased flex flex-col">
-    <!-- Minimal header -->
+    <!-- Header + 历史记录入口 -->
     <header class="shrink-0 border-b border-slate-700/80 bg-slate-950/90 backdrop-blur">
-      <div class="flex items-center gap-3 px-4 py-3">
-        <div class="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-indigo-500 to-cyan-400 text-slate-950 font-black text-sm">AI</div>
-        <h1 class="text-base font-semibold tracking-tight text-slate-100">AI 电商视觉生成器</h1>
+      <div class="flex items-center justify-between gap-3 px-4 py-3">
+        <div class="flex items-center gap-3">
+          <div class="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-indigo-500 to-cyan-400 text-slate-950 font-black text-sm">AI</div>
+          <h1 class="text-base font-semibold tracking-tight text-slate-100">AI 电商视觉生成器</h1>
+        </div>
+        <button id="historyToggle" type="button" class="rounded-lg border border-slate-600 bg-slate-800/80 px-3 py-1.5 text-sm font-medium text-slate-200 hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500/50" aria-label="历史记录">
+          历史记录
+        </button>
       </div>
     </header>
+
+    <!-- 历史记录侧边栏：左侧滑出 -->
+    <div id="historySidebar" class="hidden fixed left-0 top-0 z-40 h-full w-64 border-r border-slate-700 bg-slate-900 shadow-xl flex flex-col" aria-hidden="true">
+      <div class="flex items-center justify-between border-b border-slate-700 px-4 py-3">
+        <span class="text-sm font-semibold text-slate-200">历史记录</span>
+        <button id="historyClose" type="button" class="rounded p-1 text-slate-400 hover:bg-slate-700 hover:text-slate-200" aria-label="关闭">×</button>
+      </div>
+      <div id="historyList" class="flex-1 overflow-y-auto p-2 space-y-1">
+        <p id="historyEmpty" class="hidden text-center text-sm text-slate-500 py-6">暂无记录</p>
+        <p id="historyLoading" class="text-center text-sm text-slate-500 py-6">加载中...</p>
+      </div>
+    </div>
+    <div id="historyOverlay" class="hidden fixed inset-0 z-30 bg-black/40" aria-hidden="true"></div>
 
     <!-- Root: single row, full height, left 40% | right 60% -->
     <div class="flex flex-1 min-h-0">
@@ -180,6 +201,13 @@
       const chineseRef = document.getElementById("chineseRef");
       const japaneseFinal = document.getElementById("japaneseFinal");
       const confirmAndGenerate = document.getElementById("confirmAndGenerate");
+      const historyToggle = document.getElementById("historyToggle");
+      const historySidebar = document.getElementById("historySidebar");
+      const historyClose = document.getElementById("historyClose");
+      const historyOverlay = document.getElementById("historyOverlay");
+      const historyList = document.getElementById("historyList");
+      const historyEmpty = document.getElementById("historyEmpty");
+      const historyLoading = document.getElementById("historyLoading");
 
       /** @type {Array<{id:string, file:File, url:string}>} */
       let previewItems = [];
@@ -335,6 +363,82 @@
           }
         });
       }
+
+      // ---------- 历史记录侧边栏 ----------
+      function openHistorySidebar() {
+        historySidebar.classList.remove('hidden');
+        historySidebar.setAttribute('aria-hidden', 'false');
+        historyOverlay.classList.remove('hidden');
+        historyOverlay.setAttribute('aria-hidden', 'false');
+      }
+      function closeHistorySidebar() {
+        historySidebar.classList.add('hidden');
+        historySidebar.setAttribute('aria-hidden', 'true');
+        historyOverlay.classList.add('hidden');
+        historyOverlay.setAttribute('aria-hidden', 'true');
+      }
+
+      function formatHistoryTime(createdAt) {
+        if (!createdAt) return '';
+        const d = new Date(createdAt);
+        const now = new Date();
+        const sameDay = d.toDateString() === now.toDateString();
+        if (sameDay) return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+        return d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+      }
+
+      function fillFromHistory(row) {
+        chineseRef.textContent = row.chinese_text || '';
+        japaneseFinal.textContent = row.japanese_text || '';
+        let urls = [];
+        let prompts = [];
+        try {
+          if (row.image_urls) urls = JSON.parse(row.image_urls);
+          if (row.prompts_json) prompts = JSON.parse(row.prompts_json);
+        } catch (e) {}
+        [1, 2, 3].forEach((i) => setCardResult(i, urls[i - 1] || null, prompts[i - 1] || ''));
+        closeHistorySidebar();
+      }
+
+      async function loadHistory() {
+        historyLoading.classList.remove('hidden');
+        historyEmpty.classList.add('hidden');
+        historyList.querySelectorAll('.history-item').forEach((el) => el.remove());
+        try {
+          const res = await fetch('/api/history');
+          const rows = await res.json();
+          historyLoading.classList.add('hidden');
+          if (!Array.isArray(rows) || rows.length === 0) {
+            historyEmpty.classList.remove('hidden');
+            return;
+          }
+          rows.slice(0, 10).forEach((row) => {
+            const item = document.createElement('button');
+            item.type = 'button';
+            item.className = 'history-item w-full text-left rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2.5 hover:bg-slate-700/80 focus:outline-none focus:ring-2 focus:ring-indigo-500/50';
+            const name = document.createElement('div');
+            name.className = 'text-sm font-medium text-slate-200 truncate';
+            name.textContent = row.product_name || '（未命名）';
+            const time = document.createElement('div');
+            time.className = 'text-xs text-slate-400 mt-0.5';
+            time.textContent = formatHistoryTime(row.created_at);
+            item.appendChild(name);
+            item.appendChild(time);
+            item.addEventListener('click', () => fillFromHistory(row));
+            historyList.appendChild(item);
+          });
+        } catch (e) {
+          historyLoading.classList.add('hidden');
+          historyEmpty.classList.remove('hidden');
+          historyEmpty.textContent = '加载失败';
+        }
+      }
+
+      historyToggle.addEventListener('click', () => { openHistorySidebar(); loadHistory(); });
+      historyClose.addEventListener('click', closeHistorySidebar);
+      historyOverlay.addEventListener('click', closeHistorySidebar);
+
+      document.addEventListener('DOMContentLoaded', loadHistory);
 
       // 确认文案并生成全套组图
       let generateLoading = false;

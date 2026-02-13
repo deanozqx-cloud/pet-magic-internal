@@ -454,10 +454,12 @@
         [1, 2, 3].forEach(setCardLoading);
         setRedrawButtonsEnabled(false);
         try {
+          const productName = previewItems.length > 0 ? (previewItems[0].file.name || '').trim() : '';
+          const chineseText = (chineseRef.textContent || '').trim();
           const res = await fetch('/generate-all-visuals', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ japaneseText }),
+            body: JSON.stringify({ japaneseText, product_name: productName, chineseText }),
           });
           const json = await res.json();
           if (!res.ok) {

@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AI 电商视觉生成器</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
     <style>
       .result-editable.modified { border-color: rgba(99, 102, 241, 0.6); box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.3); }
       .card-image-loading { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.75rem; }
@@ -119,14 +121,14 @@
             ></div>
           </section>
 
-          <!-- 4. 主操作按钮 -->
+          <!-- 4. 主操作按钮（两步：先生成 Prompt，再生成图片） -->
           <section class="pt-2">
             <button
               id="confirmAndGenerate"
               type="button"
               class="w-full rounded-xl bg-indigo-600 py-3.5 text-base font-semibold text-white shadow-sm transition hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:ring-offset-2 focus:ring-offset-slate-950"
             >
-              确认文案并生成全套组图
+              生成生图 Prompt
             </button>
           </section>
         </div>
@@ -135,15 +137,17 @@
       <!-- Right column: 视觉结果 -->
       <main class="flex-1 min-h-0 overflow-y-auto bg-slate-900/30">
         <div class="p-4 sm:p-6 space-y-6">
-          <!-- Card 1: 高清白底精修图 -->
+          <!-- Card 1: 高清白底图 -->
           <article id="card1" class="rounded-xl border border-white/10 bg-white/5 shadow-sm overflow-hidden" data-card-index="1">
             <div class="p-4 sm:p-5">
-              <h3 class="text-sm font-semibold text-slate-200">1. 高清白底精修图</h3>
+              <h3 class="text-sm font-semibold text-slate-200">1. 高清白底图</h3>
               <div id="card1Image" class="mt-3 min-h-[180px] rounded-lg border border-white/10 bg-slate-800/50 flex items-center justify-center text-slate-500 text-sm">
                 占位图
               </div>
               <div class="mt-3">
-                <label for="card1Prompt" class="block text-xs font-medium text-slate-400 mb-1">生图提示词（可编辑）</label>
+                <label class="block text-xs font-medium text-slate-400 mb-1">中文说明</label>
+                <div id="card1PromptZh" class="mb-2 rounded-lg border border-white/10 bg-slate-800/30 px-3 py-2 text-sm text-slate-400 min-h-[2.5rem]">—</div>
+                <label for="card1Prompt" class="block text-xs font-medium text-slate-400 mb-1">英文生图提示词（可编辑）</label>
                 <textarea id="card1Prompt" rows="3" class="w-full resize-none rounded-lg border border-white/10 bg-slate-900/50 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-indigo-500/50 focus:outline-none focus:ring-1 focus:ring-indigo-500/50" placeholder="等待生成...">等待生成...</textarea>
               </div>
               <button id="card1Redraw" type="button" data-card="1" class="mt-3 w-full rounded-lg border border-white/10 bg-white/5 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
@@ -152,15 +156,17 @@
             </div>
           </article>
 
-          <!-- Card 2: 日文卖点可视化图 -->
+          <!-- Card 2: 产品主图 -->
           <article id="card2" class="rounded-xl border border-white/10 bg-white/5 shadow-sm overflow-hidden" data-card-index="2">
             <div class="p-4 sm:p-5">
-              <h3 class="text-sm font-semibold text-slate-200">2. 日文卖点可视化图</h3>
+              <h3 class="text-sm font-semibold text-slate-200">2. 产品主图</h3>
               <div id="card2Image" class="mt-3 min-h-[180px] rounded-lg border border-white/10 bg-slate-800/50 flex items-center justify-center text-slate-500 text-sm">
                 占位图
               </div>
               <div class="mt-3">
-                <label for="card2Prompt" class="block text-xs font-medium text-slate-400 mb-1">生图提示词（可编辑）</label>
+                <label class="block text-xs font-medium text-slate-400 mb-1">中文说明</label>
+                <div id="card2PromptZh" class="mb-2 rounded-lg border border-white/10 bg-slate-800/30 px-3 py-2 text-sm text-slate-400 min-h-[2.5rem]">—</div>
+                <label for="card2Prompt" class="block text-xs font-medium text-slate-400 mb-1">英文生图提示词（可编辑）</label>
                 <textarea id="card2Prompt" rows="3" class="w-full resize-none rounded-lg border border-white/10 bg-slate-900/50 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-indigo-500/50 focus:outline-none focus:ring-1 focus:ring-indigo-500/50" placeholder="等待生成...">等待生成...</textarea>
               </div>
               <button id="card2Redraw" type="button" data-card="2" class="mt-3 w-full rounded-lg border border-white/10 bg-white/5 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
@@ -169,15 +175,17 @@
             </div>
           </article>
 
-          <!-- Card 3: 日本本土场景图 -->
+          <!-- Card 3: 产品功能卖点介绍图 -->
           <article id="card3" class="rounded-xl border border-white/10 bg-white/5 shadow-sm overflow-hidden" data-card-index="3">
             <div class="p-4 sm:p-5">
-              <h3 class="text-sm font-semibold text-slate-200">3. 日本本土场景图</h3>
+              <h3 class="text-sm font-semibold text-slate-200">3. 产品功能卖点介绍图</h3>
               <div id="card3Image" class="mt-3 min-h-[180px] rounded-lg border border-white/10 bg-slate-800/50 flex items-center justify-center text-slate-500 text-sm">
                 占位图
               </div>
               <div class="mt-3">
-                <label for="card3Prompt" class="block text-xs font-medium text-slate-400 mb-1">生图提示词（可编辑）</label>
+                <label class="block text-xs font-medium text-slate-400 mb-1">中文说明</label>
+                <div id="card3PromptZh" class="mb-2 rounded-lg border border-white/10 bg-slate-800/30 px-3 py-2 text-sm text-slate-400 min-h-[2.5rem]">—</div>
+                <label for="card3Prompt" class="block text-xs font-medium text-slate-400 mb-1">英文生图提示词（可编辑）</label>
                 <textarea id="card3Prompt" rows="3" class="w-full resize-none rounded-lg border border-white/10 bg-slate-900/50 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-indigo-500/50 focus:outline-none focus:ring-1 focus:ring-indigo-500/50" placeholder="等待生成...">等待生成...</textarea>
               </div>
               <button id="card3Redraw" type="button" data-card="3" class="mt-3 w-full rounded-lg border border-white/10 bg-white/5 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
@@ -185,6 +193,43 @@
               </button>
             </div>
           </article>
+
+          <!-- Card 4: 产品场景图 -->
+          <article id="card4" class="rounded-xl border border-white/10 bg-white/5 shadow-sm overflow-hidden" data-card-index="4">
+            <div class="p-4 sm:p-5">
+              <h3 class="text-sm font-semibold text-slate-200">4. 产品场景图</h3>
+              <div id="card4Image" class="mt-3 min-h-[180px] rounded-lg border border-white/10 bg-slate-800/50 flex items-center justify-center text-slate-500 text-sm">
+                占位图
+              </div>
+              <div class="mt-3">
+                <label class="block text-xs font-medium text-slate-400 mb-1">中文说明</label>
+                <div id="card4PromptZh" class="mb-2 rounded-lg border border-white/10 bg-slate-800/30 px-3 py-2 text-sm text-slate-400 min-h-[2.5rem]">—</div>
+                <label for="card4Prompt" class="block text-xs font-medium text-slate-400 mb-1">英文生图提示词（可编辑）</label>
+                <textarea id="card4Prompt" rows="3" class="w-full resize-none rounded-lg border border-white/10 bg-slate-900/50 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-indigo-500/50 focus:outline-none focus:ring-1 focus:ring-indigo-500/50" placeholder="等待生成...">等待生成...</textarea>
+              </div>
+              <button id="card4Redraw" type="button" data-card="4" class="mt-3 w-full rounded-lg border border-white/10 bg-white/5 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-indigo-500/50">
+                修改提示词并单独重绘
+              </button>
+            </div>
+          </article>
+
+          <!-- 确认 Prompt 并生成全部图片 + 打包下载 -->
+          <section class="rounded-xl border border-white/10 bg-white/5 p-4 sm:p-5 space-y-3">
+            <button
+              id="confirmPromptAndGenerate"
+              type="button"
+              class="w-full rounded-xl bg-indigo-600 py-3 text-base font-semibold text-white shadow-sm transition hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:ring-offset-2 focus:ring-offset-slate-950"
+            >
+              确认 Prompt 并生成全部图片
+            </button>
+            <button
+              id="packDownloadBtn"
+              type="button"
+              class="w-full rounded-xl border border-white/20 bg-slate-800/80 py-3 text-base font-semibold text-slate-200 transition hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
+            >
+              📦 打包下载
+            </button>
+          </section>
         </div>
       </main>
     </div>
@@ -325,9 +370,10 @@
         el.innerHTML = '<div class="spinner" aria-hidden="true"></div><span>AI 正在作画中...</span><div class="progress-bar"><div class="progress-bar-inner"></div></div>';
       }
 
-      function setCardResult(cardIndex, url, promptText) {
+      function setCardResult(cardIndex, url, promptEn, promptZh) {
         const imageEl = document.getElementById(`card${cardIndex}Image`);
         const promptEl = document.getElementById(`card${cardIndex}Prompt`);
+        const promptZhEl = document.getElementById(`card${cardIndex}PromptZh`);
         const redrawBtn = document.getElementById(`card${cardIndex}Redraw`);
         if (imageEl) {
           imageEl.className = "mt-3 min-h-[180px] rounded-lg border border-white/10 bg-slate-800/50 overflow-hidden flex items-center justify-center";
@@ -345,7 +391,8 @@
             imageEl.appendChild(span);
           }
         }
-        if (promptEl) promptEl.value = promptText || '';
+        if (promptEl) promptEl.value = (promptEn != null ? promptEn : '') || '';
+        if (promptZhEl) promptZhEl.textContent = (promptZh != null ? promptZh : '') || '—';
         if (redrawBtn) {
           redrawBtn.disabled = !url;
           if (url) redrawBtn.classList.remove('opacity-50', 'cursor-not-allowed');
@@ -354,7 +401,7 @@
       }
 
       function setRedrawButtonsEnabled(enabled) {
-        [1, 2, 3].forEach((i) => {
+        [1, 2, 3, 4].forEach((i) => {
           const btn = document.getElementById(`card${i}Redraw`);
           if (btn) {
             btn.disabled = !enabled;
@@ -396,7 +443,7 @@
           if (row.image_urls) urls = JSON.parse(row.image_urls);
           if (row.prompts_json) prompts = JSON.parse(row.prompts_json);
         } catch (e) {}
-        [1, 2, 3].forEach((i) => setCardResult(i, urls[i - 1] || null, prompts[i - 1] || ''));
+        [1, 2, 3, 4].forEach((i) => setCardResult(i, urls[i - 1] || null, prompts[i - 1] || '', ''));
         closeHistorySidebar();
       }
 
@@ -440,55 +487,109 @@
 
       document.addEventListener('DOMContentLoaded', loadHistory);
 
-      // 确认文案并生成全套组图
-      let generateLoading = false;
+      const PROMPT_ORDER = ['pure_product', 'main_image', 'infographic', 'lifestyle'];
+
+      // 生成生图 Prompt（仅生成 4 段中英文 Prompt，不生图）
+      let generatePromptLoading = false;
       confirmAndGenerate.addEventListener("click", async () => {
         const japaneseText = (japaneseFinal.innerText || japaneseFinal.textContent || '').trim();
-        if (!japaneseText) {
-          alert('请先填写或解析出「日文本土化文案」后再生成。');
+        const chineseText = (chineseRef.textContent || '').trim();
+        if (!japaneseText && !chineseText) {
+          alert('请先填写或解析出「中文/日文文案」后再生成 Prompt。');
           return;
         }
-        if (generateLoading) return;
-        generateLoading = true;
+        if (generatePromptLoading) return;
+        generatePromptLoading = true;
         confirmAndGenerate.disabled = true;
-        [1, 2, 3].forEach(setCardLoading);
-        setRedrawButtonsEnabled(false);
         try {
-          const productName = previewItems.length > 0 ? (previewItems[0].file.name || '').trim() : '';
-          const chineseText = (chineseRef.textContent || '').trim();
-          const res = await fetch('/generate-all-visuals', {
+          const res = await fetch('/generate-prompts', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ japaneseText, product_name: productName, chineseText }),
+            body: JSON.stringify({ japaneseText, chineseText }),
           });
           const json = await res.json();
           if (!res.ok) {
-            alert('生成失败：' + (json.message || json.error || res.statusText));
-            [1, 2, 3].forEach((i) => setCardResult(i, null, ''));
+            alert('Prompt 生成失败：' + (json.message || json.error || res.statusText));
             return;
           }
-          if (!json.success || !Array.isArray(json.data)) {
-            alert('生成失败：返回数据异常');
-            [1, 2, 3].forEach((i) => setCardResult(i, null, ''));
+          if (!json.success || !json.data) {
+            alert('Prompt 生成失败：返回数据异常');
             return;
           }
           const data = json.data;
-          data.forEach((item, index) => {
-            const i = index + 1;
-            setCardResult(i, item.url || null, item.prompt || '');
+          [1, 2, 3, 4].forEach((i) => {
+            const key = PROMPT_ORDER[i - 1];
+            const item = data[key];
+            const zh = item && item.zh ? String(item.zh) : '';
+            const en = item && item.en ? String(item.en) : '';
+            setCardResult(i, null, en, zh);
           });
         } catch (e) {
-          alert('生成失败：' + (e.message || '网络错误'));
-          [1, 2, 3].forEach((i) => setCardResult(i, null, ''));
+          alert('Prompt 生成失败：' + (e.message || '网络错误'));
         } finally {
-          generateLoading = false;
+          generatePromptLoading = false;
           confirmAndGenerate.disabled = false;
         }
       });
 
+      // 确认 Prompt 并生成全部图片
+      const confirmPromptAndGenerate = document.getElementById('confirmPromptAndGenerate');
+      let generateImagesLoading = false;
+      confirmPromptAndGenerate.addEventListener('click', async () => {
+        const prompts = [1, 2, 3, 4].map((i) => {
+          const el = document.getElementById(`card${i}Prompt`);
+          return el ? String(el.value || '').trim() : '';
+        });
+        if (prompts.some((p) => !p)) {
+          alert('请先点击「生成生图 Prompt」并确保 4 张卡片的英文提示词均已填写。');
+          return;
+        }
+        if (generateImagesLoading) return;
+        generateImagesLoading = true;
+        confirmPromptAndGenerate.disabled = true;
+        [1, 2, 3, 4].forEach(setCardLoading);
+        setRedrawButtonsEnabled(false);
+        try {
+          const productName = previewItems.length > 0 ? (previewItems[0].file.name || '').trim() : '';
+          const chineseText = (chineseRef.textContent || '').trim();
+          const japaneseText = (japaneseFinal.innerText || japaneseFinal.textContent || '').trim();
+          const res = await fetch('/generate-images', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompts, product_name: productName, chineseText, japaneseText }),
+          });
+          const json = await res.json();
+          if (!res.ok) {
+            alert('生成失败：' + (json.message || json.error || res.statusText));
+            [1, 2, 3, 4].forEach((i) => setCardResult(i, null, prompts[i - 1], ''));
+            return;
+          }
+          if (!json.success || !Array.isArray(json.data)) {
+            alert('生成失败：返回数据异常');
+            [1, 2, 3, 4].forEach((i) => setCardResult(i, null, prompts[i - 1], ''));
+            return;
+          }
+          json.data.forEach((item, index) => {
+            const i = index + 1;
+            const promptEl = document.getElementById(`card${i}Prompt`);
+            const promptZhEl = document.getElementById(`card${i}PromptZh`);
+            setCardResult(i, item.url || null, item.prompt || (promptEl && promptEl.value) || '', (promptZhEl && promptZhEl.textContent) || '');
+          });
+        } catch (e) {
+          alert('生成失败：' + (e.message || '网络错误'));
+          [1, 2, 3, 4].forEach((i) => {
+            const promptEl = document.getElementById(`card${i}Prompt`);
+            setCardResult(i, null, promptEl ? promptEl.value : '', '');
+          });
+        } finally {
+          generateImagesLoading = false;
+          confirmPromptAndGenerate.disabled = false;
+        }
+      });
+
       // 修改提示词并单独重绘：调用 /regenerate-single，按 type 更新对应卡片图片
-      const cardTypes = { 1: '白底图', 2: '卖点图', 3: '场景图' };
-      [1, 2, 3].forEach((i) => {
+      const cardTypes = { 1: '白底图', 2: '主图', 3: '卖点图', 4: '场景图' };
+      [1, 2, 3, 4].forEach((i) => {
         const btn = document.getElementById(`card${i}Redraw`);
         const promptEl = document.getElementById(`card${i}Prompt`);
         const imageEl = document.getElementById(`card${i}Image`);
@@ -538,6 +639,63 @@
             btn.classList.remove('opacity-50', 'cursor-not-allowed');
           }
         });
+      });
+
+      // 打包下载：4 张卡片图片 + 文案 TXT，通过代理 fetch 转 Blob 后打 ZIP
+      const packDownloadBtn = document.getElementById('packDownloadBtn');
+      packDownloadBtn.addEventListener('click', async () => {
+        const chineseText = (chineseRef.textContent || '').trim();
+        const japaneseText = (japaneseFinal.innerText || japaneseFinal.textContent || '').trim();
+        const names = ['1-高清白底图', '2-产品主图', '3-产品功能卖点介绍图', '4-产品场景图'];
+        const urls = [1, 2, 3, 4].map((i) => {
+          const el = document.querySelector(`#card${i}Image img`);
+          return el && el.src ? el.src : null;
+        });
+        const hasAny = urls.some(Boolean);
+        if (!hasAny) {
+          alert('请先生成全部图片后再打包下载。');
+          return;
+        }
+        if (typeof JSZip === 'undefined' || typeof saveAs === 'undefined') {
+          alert('缺少 JSZip 或 FileSaver，请刷新页面重试。');
+          return;
+        }
+        packDownloadBtn.disabled = true;
+        packDownloadBtn.textContent = '正在打包...';
+        try {
+          const zip = new JSZip();
+          for (let i = 0; i < 4; i++) {
+            const url = urls[i];
+            if (!url) continue;
+            let blob;
+            if (url.startsWith('data:')) {
+              const res = await fetch(url);
+              blob = await res.blob();
+            } else {
+              const res = await fetch('/api/proxy-image?url=' + encodeURIComponent(url));
+              if (!res.ok) throw new Error('图片下载失败: ' + (i + 1));
+              blob = await res.blob();
+            }
+            const ext = (blob.type || '').indexOf('png') >= 0 ? 'png' : 'jpg';
+            zip.file(names[i] + '.' + ext, blob);
+          }
+          const txtContent = [
+            '=== 中文文案 ===',
+            chineseText || '（无）',
+            '',
+            '=== 日文文案 ===',
+            japaneseText || '（无）',
+          ].join('\n');
+          zip.file('文案.txt', txtContent);
+          const zipBlob = await zip.generateAsync({ type: 'blob' });
+          const fileName = '电商组图_' + new Date().toISOString().slice(0, 10) + '.zip';
+          saveAs(zipBlob, fileName);
+        } catch (e) {
+          alert('打包下载失败：' + (e.message || '未知错误'));
+        } finally {
+          packDownloadBtn.disabled = false;
+          packDownloadBtn.textContent = '📦 打包下载';
+        }
       });
     </script>
   </body>

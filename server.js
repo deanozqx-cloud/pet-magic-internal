@@ -6,10 +6,14 @@ require('dotenv').config({ path: path.join(__dirname, 'sili.env') });
 
 function loadSiliEnv() {
   const siliPath = path.join(__dirname, 'sili.env');
-  if (!fs.existsSync(siliPath)) return;
-  const raw = fs.readFileSync(siliPath, 'utf8').replace(/^\uFEFF/, '');
-  for (const line of raw.split(/\r?\n/)) {
+  if (!fs.existsSync(siliPath)) {
+    console.warn('[loadSiliEnv] 文件不存在:', siliPath);
+    return;
+  }
+  const raw = fs.readFileSync(siliPath, 'utf8').replace(/^\uFEFF/, '').replace(/\r/g, '');
+  for (const line of raw.split(/\n/)) {
     const trimmed = line.trim();
+    if (trimmed.startsWith('#') || !trimmed) continue;
     if (trimmed.startsWith('SILICONFLOW_API_KEY=')) {
       process.env.SILICONFLOW_API_KEY = trimmed.slice('SILICONFLOW_API_KEY='.length).trim().replace(/\s+/g, '');
     } else if (trimmed.startsWith('DEEPSEEK_API_KEY=')) {
@@ -20,6 +24,11 @@ function loadSiliEnv() {
       const key = trimmed.startsWith('HF_TOKEN=') ? 'HF_TOKEN=' : 'HUGGINGFACE_TOKEN=';
       const val = trimmed.slice(key.length).trim().replace(/\s+/g, '');
       process.env.HF_TOKEN = val || process.env.HF_TOKEN;
+    } else if (trimmed.includes('PHOTOROOM_API_KEY')) {
+      const m = trimmed.match(/PHOTOROOM_API_KEY\s*=\s*([^#\s]+)/);
+      if (m && m[1]) process.env.PHOTOROOM_API_KEY = m[1].trim();
+    } else if (trimmed.startsWith('PHOTOROOM_PROXY=')) {
+      process.env.PHOTOROOM_PROXY = trimmed.slice('PHOTOROOM_PROXY='.length).trim();
     }
   }
 }
@@ -36,11 +45,22 @@ loadSiliEnv();
 if (process.env.DEEPSEEK_API_KEY) console.log('DEEPSEEK_API_KEY 已加载（生图提示词生成）');
 if (process.env.HF_TOKEN) console.log('HF_TOKEN 已加载（免费生图：Hugging Face Inference API）');
 if (process.env.REPLICATE_API_TOKEN) console.log('REPLICATE_API_TOKEN 已加载（FLUX 生图，付费）');
+if (process.env.PHOTOROOM_API_KEY) {
+  console.log('PHOTOROOM_API_KEY 已加载（四视角白底图）');
+  if (process.env.PHOTOROOM_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY) {
+    console.log('Photoroom 将使用代理:', process.env.PHOTOROOM_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY);
+  }
+} else {
+  const siliPath = path.join(__dirname, 'sili.env');
+  console.warn('未找到 PHOTOROOM_API_KEY。请确认', siliPath, '中有 PHOTOROOM_API_KEY=xxx');
+}
 
 // ========== 依赖引入 ==========
 const express = require('express');
 const multer = require('multer');
 const axios = require('axios');
+const FormData = require('form-data');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const Database = require('better-sqlite3');
 const db = new Database(path.join(__dirname, 'history.db'));
 
@@ -104,6 +124,64 @@ const upload = multer({
   },
 });
 
+const memoryStorage = multer.memoryStorage();
+const uploadMemory = multer({
+  storage: memoryStorage,
+  fileFilter: function (req, file, cb) {
+    const allowed = /^image\/(jpeg|png|gif|webp)/i.test(file.mimetype);
+    if (allowed) cb(null, true);
+    else cb(new Error('仅支持图片格式：JPEG、PNG、GIF、WebP'));
+  },
+});
+
+const PHOTOROOM_BASE = (process.env.PHOTOROOM_API_BASE || 'https://sdk.photoroom.com').replace(/\/$/, '');
+
+function getPhotoroomAgent() {
+  loadSiliEnv();
+  const proxy = (process.env.PHOTOROOM_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '').trim();
+  if (!proxy) return undefined;
+  return new HttpsProxyAgent(proxy);
+}
+
+async function processSingleImage(fileBuffer, perspective) {
+  const apiKey = (process.env.PHOTOROOM_API_KEY || '').trim().replace(/\s+/g, '');
+  if (!apiKey) return { error: '未配置 PHOTOROOM_API_KEY' };
+  try {
+    const form = new FormData();
+    const ext = (process.env.PHOTOROOM_IMAGE_EXT || 'jpg').toLowerCase().replace(/^\./, '');
+    const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
+    form.append('image_file', fileBuffer, { filename: `product-${perspective}.${ext}`, contentType: mime });
+    form.append('bg_color', (process.env.PHOTOROOM_BG_COLOR || '#FFFFFF').trim());
+    form.append('size', (process.env.PHOTOROOM_SIZE || 'full').trim());
+    if (process.env.PHOTOROOM_CROP === 'true') form.append('crop', 'true');
+    if (process.env.PHOTOROOM_FORMAT) form.append('format', process.env.PHOTOROOM_FORMAT.trim());
+    const agent = getPhotoroomAgent();
+    const axiosConfig = {
+      headers: { 'x-api-key': apiKey, ...form.getHeaders() },
+      responseType: 'arraybuffer',
+      timeout: parseInt(process.env.PHOTOROOM_TIMEOUT_MS || '120000', 10) || 120000,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+    };
+    if (agent) axiosConfig.httpsAgent = agent;
+    const response = await axios.post(`${PHOTOROOM_BASE}/v1/segment`, form, axiosConfig);
+    const contentType = response.headers['content-type'] || 'image/png';
+    const url = `data:${contentType};base64,${Buffer.from(response.data).toString('base64')}`;
+    return { url };
+  } catch (err) {
+    const status = err.response?.status;
+    const body = err.response?.data;
+    let message = err.message;
+    if (body) {
+      if (Buffer.isBuffer(body)) message = body.toString('utf8').slice(0, 200);
+      else if (typeof body === 'object' && body.message) message = body.message;
+      else if (typeof body === 'string') message = body.slice(0, 200);
+    }
+    console.error(`[processSingleImage] ${perspective} 失败:`, status ? `[${status}] ${message}` : message);
+    return { error: status ? `[${status}] ${message}` : message };
+  }
+}
+
 // ========== 辅助函数 ==========
 function getEnvKey(name) {
   let val = (process.env[name] || '').trim().replace(/\s+/g, '');
@@ -124,21 +202,34 @@ async function generateOneImage(prompt, index) {
     return { url: null, prompt, error: '未配置任何生图 API Key' };
   }
 
-  // SiliconFlow
+  // SiliconFlow（限流时重试 + 退避）
   if (useSiliconFlow) {
-    try {
-      const MODEL = (process.env.SILICONFLOW_IMAGE_MODEL || 'Kwai-Kolors/Kolors').trim();
-      const imgRes = await axios.post(
-        `${siliconflowBase}/v1/images/generations`,
-        { model: MODEL, prompt, image_size: '1024x1024', batch_size: 1, num_inference_steps: 20, guidance_scale: 7.5 },
-        { headers: { Authorization: `Bearer ${siliconflowKey}`, 'Content-Type': 'application/json' }, timeout: 120000 }
-      );
-      return { url: imgRes.data?.images?.[0]?.url || null, prompt, error: null };
-    } catch (err) {
-      const msg = err.response?.data?.message || err.response?.data?.error || err.message;
-      console.error(`SiliconFlow 生图 [${index}] 失败:`, msg);
-      return { url: null, prompt, error: String(msg).slice(0, 200) };
+    const MODEL = (process.env.SILICONFLOW_IMAGE_MODEL || 'Kwai-Kolors/Kolors').trim();
+    const maxRetries = Math.min(parseInt(process.env.SILICONFLOW_RATE_LIMIT_RETRIES || '3', 10) || 3, 5);
+    const retryDelayMs = parseInt(process.env.SILICONFLOW_RATE_LIMIT_DELAY_MS || '25000', 10) || 25000;
+    let lastMsg = '';
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const imgRes = await axios.post(
+          `${siliconflowBase}/v1/images/generations`,
+          { model: MODEL, prompt, image_size: '1024x1024', batch_size: 1, num_inference_steps: 20, guidance_scale: 7.5 },
+          { headers: { Authorization: `Bearer ${siliconflowKey}`, 'Content-Type': 'application/json' }, timeout: 120000 }
+        );
+        return { url: imgRes.data?.images?.[0]?.url || null, prompt, error: null };
+      } catch (err) {
+        const msg = err.response?.data?.message || err.response?.data?.error || err.message;
+        lastMsg = String(msg);
+        const isRateLimit = err.response?.status === 429 || /rate limit|IPM limit|limit reached/i.test(lastMsg);
+        if (isRateLimit && attempt < maxRetries) {
+          console.warn(`SiliconFlow 生图 [${index}] 限流，${retryDelayMs / 1000}s 后第 ${attempt + 1} 次重试...`);
+          await new Promise(r => setTimeout(r, retryDelayMs));
+        } else {
+          console.error(`SiliconFlow 生图 [${index}] 失败:`, lastMsg);
+          return { url: null, prompt, error: lastMsg.slice(0, 200) };
+        }
+      }
     }
+    return { url: null, prompt, error: (lastMsg || 'SiliconFlow 生图失败').slice(0, 200) };
   }
 
   // Hugging Face
@@ -428,7 +519,10 @@ app.post('/generate-images', async function (req, res) {
   }
 
   try {
-    const delayMs = siliconflowKey ? 2000 : (hfToken ? 2000 : Math.max(10000, parseInt(process.env.REPLICATE_DELAY_MS || '15000', 10) || 15000));
+    // SiliconFlow 易触发 IPM 限流，默认每张间隔 15 秒；可用 SILICONFLOW_IMAGE_DELAY_MS 覆盖
+    const delayMs = siliconflowKey
+      ? (parseInt(process.env.SILICONFLOW_IMAGE_DELAY_MS || '15000', 10) || 15000)
+      : (hfToken ? 2000 : Math.max(10000, parseInt(process.env.REPLICATE_DELAY_MS || '15000', 10) || 15000));
     const results = [];
     for (let i = 0; i < prompts.length; i++) {
       if (i > 0) await new Promise(r => setTimeout(r, delayMs));
@@ -476,6 +570,46 @@ app.post('/regenerate-single', async function (req, res) {
     const msg = err.response?.data?.detail || err.response?.data?.error || err.message;
     res.status(502).json({ success: false, message: String(msg), type: type || '' });
   }
+});
+
+// ========== 路由：GET/POST /generate-white-background（四视角白底图） ==========
+app.get('/generate-white-background', function (req, res) {
+  res.status(200).json({
+    message: '请使用 POST 请求，并上传 multipart/form-data：front（必填）、left、right、bottom',
+    usage: 'POST /generate-white-background with fields: front, left?, right?, bottom?',
+  });
+});
+
+const whiteBgFields = [
+  { name: 'front', maxCount: 1 },
+  { name: 'left', maxCount: 1 },
+  { name: 'right', maxCount: 1 },
+  { name: 'bottom', maxCount: 1 },
+];
+app.post('/generate-white-background', uploadMemory.fields(whiteBgFields), async function (req, res) {
+  const files = req.files || {};
+  const frontFile = Array.isArray(files.front) ? files.front[0] : files.front;
+  const leftFile = Array.isArray(files.left) ? files.left[0] : files.left;
+  const rightFile = Array.isArray(files.right) ? files.right[0] : files.right;
+  const bottomFile = Array.isArray(files.bottom) ? files.bottom[0] : files.bottom;
+  if (!frontFile || !frontFile.buffer) {
+    res.status(400).json({ success: false, message: '请至少上传正面视角图片（字段名：front）' });
+    return;
+  }
+  const tasks = [];
+  const keys = [];
+  if (frontFile && frontFile.buffer) { tasks.push(processSingleImage(frontFile.buffer, 'front')); keys.push('front'); }
+  if (leftFile && leftFile.buffer) { tasks.push(processSingleImage(leftFile.buffer, 'left')); keys.push('left'); }
+  if (rightFile && rightFile.buffer) { tasks.push(processSingleImage(rightFile.buffer, 'right')); keys.push('right'); }
+  if (bottomFile && bottomFile.buffer) { tasks.push(processSingleImage(bottomFile.buffer, 'bottom')); keys.push('bottom'); }
+  const results = await Promise.all(tasks);
+  const data = {};
+  keys.forEach((key, i) => {
+    const r = results[i];
+    if (r.url) data[key] = { url: r.url };
+    else data[key] = { error: r.error || '处理失败' };
+  });
+  res.json({ success: true, data });
 });
 
 // ========== 路由：GET /api/proxy-image（图片代理下载，解决 CORS） ==========

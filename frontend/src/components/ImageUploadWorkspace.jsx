@@ -23,7 +23,7 @@ const initialSlotState = () => ({
   errorMessage: null,
 });
 
-const API_BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '');
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? 'http://119.28.142.172:3000').replace(/\/$/, '');
 
 const DEFAULT_PROMPT =
   '产品正面视角,纯白色背景,专业摄影棚光,均匀柔和的照明,无阴影,产品居中放置,细节清晰可见。 Front view of product, pure white background...';

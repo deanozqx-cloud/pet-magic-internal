@@ -84,8 +84,9 @@ const insertHistory = db.prepare(`
 `);
 
 // ========== Express 应用 ==========
+// 强制全局 CORS，必须在所有路由之前
 const app = express();
-app.use(cors());
+app.use(cors({ origin: true, methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json({ limit: '2mb' }));
 
 // 静态文件
@@ -574,7 +575,14 @@ app.post('/regenerate-single', async function (req, res) {
   }
 });
 
-// ========== 路由：GET/POST /generate-white-background（四视角白底图） ==========
+// ========== 路由：/generate-white-background（四视角白底图，与前端严格一致） ==========
+// OPTIONS 预检，确保 CORS 预检请求返回 200 与正确头
+app.options('/generate-white-background', function (req, res) {
+  res.set('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.status(204).end();
+});
 app.get('/generate-white-background', function (req, res) {
   res.status(200).json({
     message: '请使用 POST 请求，并上传 multipart/form-data：front（必填）、left、right、bottom',

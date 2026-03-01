@@ -57,6 +57,7 @@ if (process.env.PHOTOROOM_API_KEY) {
 
 // ========== 依赖引入 ==========
 const express = require('express');
+const cors = require('cors');
 const multer = require('multer');
 const axios = require('axios');
 const FormData = require('form-data');
@@ -84,6 +85,7 @@ const insertHistory = db.prepare(`
 
 // ========== Express 应用 ==========
 const app = express();
+app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
 // 静态文件

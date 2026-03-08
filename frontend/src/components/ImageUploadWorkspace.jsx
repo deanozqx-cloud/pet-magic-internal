@@ -99,6 +99,7 @@ export default function ImageUploadWorkspace() {
     try {
       const form = new FormData();
       withFile.forEach(({ key }) => form.append(key, slots[key].file));
+      form.append('engine', extractEngine);
 
       const res = await fetch(`${API_BASE}/generate-white-background`, {
         method: 'POST',
@@ -145,7 +146,7 @@ export default function ImageUploadWorkspace() {
     } finally {
       setIsGenerating(false);
     }
-  }, [slots, updateSlot]);
+  }, [slots, updateSlot, extractEngine]);
 
   const canGenerate = !!slots.front.file;
 
@@ -305,6 +306,7 @@ export default function ImageUploadWorkspace() {
                   className="h-9 flex-[6] border-gray-200 bg-slate-100"
                 >
                   <option value="photoroom">Photoroom (复合增强)</option>
+                  <option value="aliyun">通义万相（商品分割）</option>
                 </Select>
                 <Button
                   size="default"

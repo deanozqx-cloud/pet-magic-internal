@@ -82,6 +82,7 @@ if (hasAliyunKey()) {
 }
 
 // ========== 依赖引入 ==========
+const crypto = require('crypto');
 const express = require('express');
 const ImagesegClient = require('@alicloud/imageseg20191230');
 const OpenapiClient = require('@alicloud/openapi-client');
@@ -668,6 +669,17 @@ app.post('/regenerate-single', async function (req, res) {
   }
 });
 
+// ========== 白底图任务存储（异步提交+轮询，避免长连接超时） ==========
+const whiteBgJobs = new Map();
+const JOB_TTL_MS = 60 * 60 * 1000;
+function cleanupWhiteBgJobs() {
+  const now = Date.now();
+  for (const [id, job] of whiteBgJobs.entries()) {
+    if (now - (job.createdAt || 0) > JOB_TTL_MS) whiteBgJobs.delete(id);
+  }
+}
+setInterval(cleanupWhiteBgJobs, 10 * 60 * 1000);
+
 // ========== 路由：/generate-white-background（四视角白底图，与前端严格一致） ==========
 // 为跨域请求统一设置 CORS 头（避免本地/远程前端被拦截）
 function setCorsForWhiteBg(req, res) {
@@ -681,11 +693,16 @@ app.options('/generate-white-background', function (req, res) {
   setCorsForWhiteBg(req, res);
   res.status(204).end();
 });
+app.options('/generate-white-background-async', function (req, res) {
+  setCorsForWhiteBg(req, res);
+  res.status(204).end();
+});
 app.get('/generate-white-background', function (req, res) {
   setCorsForWhiteBg(req, res);
   res.status(200).json({
     message: '请使用 POST 请求，并上传 multipart/form-data：front（必填）、left、right、bottom',
     usage: 'POST /generate-white-background with fields: front, left?, right?, bottom?',
+    async: '推荐使用 POST /generate-white-background-async 提交后轮询 GET /generate-white-background/status/:jobId 避免超时',
   });
 });
 
@@ -695,6 +712,83 @@ const whiteBgFields = [
   { name: 'right', maxCount: 1 },
   { name: 'bottom', maxCount: 1 },
 ];
+
+// 异步提交：立即返回 jobId，后台处理（适合通义万相等耗时接口，避免长连接超时）
+app.post('/generate-white-background-async', uploadMemory.fields(whiteBgFields), function (req, res) {
+  setCorsForWhiteBg(req, res);
+  try {
+    const files = req.files || {};
+    const frontFile = Array.isArray(files.front) ? files.front[0] : files.front;
+    const leftFile = Array.isArray(files.left) ? files.left[0] : files.left;
+    const rightFile = Array.isArray(files.right) ? files.right[0] : files.right;
+    const bottomFile = Array.isArray(files.bottom) ? files.bottom[0] : files.bottom;
+    if (!frontFile || !frontFile.buffer) {
+      res.status(400).json({ success: false, message: '请至少上传正面视角图片（字段名：front）' });
+      return;
+    }
+    const jobId = crypto.randomUUID();
+    const engineRaw = (req.body && req.body.engine) ? String(req.body.engine).trim().toLowerCase() : '';
+    const useAliyun = engineRaw === 'aliyun' || engineRaw === '通义万相' || engineRaw === 'aliyun_imageseg';
+    const processOne = useAliyun ? processImageByAliyun : processSingleImage;
+
+    whiteBgJobs.set(jobId, { status: 'processing', data: null, error: null, createdAt: Date.now() });
+
+    setImmediate(async () => {
+      try {
+        const tasks = [];
+        const keys = [];
+        if (frontFile && frontFile.buffer) { tasks.push(processOne(frontFile.buffer, 'front')); keys.push('front'); }
+        if (leftFile && leftFile.buffer) { tasks.push(processOne(leftFile.buffer, 'left')); keys.push('left'); }
+        if (rightFile && rightFile.buffer) { tasks.push(processOne(rightFile.buffer, 'right')); keys.push('right'); }
+        if (bottomFile && bottomFile.buffer) { tasks.push(processOne(bottomFile.buffer, 'bottom')); keys.push('bottom'); }
+        const results = await Promise.all(tasks);
+        const data = {};
+        keys.forEach((key, i) => {
+          const r = results[i];
+          if (r.url) data[key] = { url: r.url };
+          else data[key] = { error: r.error || '处理失败' };
+        });
+        const job = whiteBgJobs.get(jobId);
+        if (job) { job.status = 'done'; job.data = data; }
+      } catch (err) {
+        console.error('[generate-white-background-async]', jobId, err.message);
+        const job = whiteBgJobs.get(jobId);
+        if (job) { job.status = 'error'; job.error = err.message || '服务异常'; }
+      }
+    });
+
+    res.json({ success: true, jobId });
+  } catch (err) {
+    console.error('[generate-white-background-async]', err.message);
+    res.status(500).json({ success: false, message: '服务异常：' + (err.message || '未知错误') });
+  }
+});
+
+app.options('/generate-white-background/status/:jobId', function (req, res) {
+  setCorsForWhiteBg(req, res);
+  res.status(204).end();
+});
+// 轮询任务状态
+app.get('/generate-white-background/status/:jobId', function (req, res) {
+  setCorsForWhiteBg(req, res);
+  const jobId = (req.params.jobId || '').trim();
+  if (!jobId) {
+    res.status(400).json({ success: false, message: '缺少 jobId' });
+    return;
+  }
+  const job = whiteBgJobs.get(jobId);
+  if (!job) {
+    res.status(404).json({ success: false, message: '任务不存在或已过期', status: 'not_found' });
+    return;
+  }
+  res.json({
+    success: true,
+    status: job.status,
+    data: job.data || undefined,
+    error: job.error || undefined,
+  });
+});
+
 app.post('/generate-white-background', uploadMemory.fields(whiteBgFields), async function (req, res) {
   setCorsForWhiteBg(req, res);
   try {

@@ -101,50 +101,86 @@ export default function ImageUploadWorkspace() {
       withFile.forEach(({ key }) => form.append(key, slots[key].file));
       form.append('engine', extractEngine);
 
-      // 通义万相可能需 30–60 秒，将超时设为 120 秒避免 408
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 120000);
-      const res = await fetch(`${API_BASE}/generate-white-background`, {
+      // 使用异步接口：先提交拿到 jobId，再轮询结果，避免长连接被中间网络/代理超时断开
+      const submitRes = await fetch(`${API_BASE}/generate-white-background-async`, {
         method: 'POST',
         body: form,
-        signal: controller.signal,
       });
-      clearTimeout(timeoutId);
-      const json = await res.json().catch(() => ({}));
+      const submitJson = await submitRes.json().catch(() => ({}));
 
-      if (!res.ok) {
-        const msg = json.message || json.error || `请求失败 (${res.status})`;
+      if (!submitRes.ok) {
+        const msg = submitJson.message || submitJson.error || `提交失败 (${submitRes.status})`;
         withFile.forEach(({ key }) =>
           updateSlot(key, { status: 'error', resultUrl: null, errorMessage: msg })
         );
         return;
       }
 
-      if (!json.success || !json.data) {
+      if (!submitJson.success || !submitJson.jobId) {
         withFile.forEach(({ key }) =>
           updateSlot(key, {
             status: 'error',
             resultUrl: null,
-            errorMessage: json.message || '服务器未返回结果',
+            errorMessage: submitJson.message || '服务器未返回任务 ID',
           })
         );
         return;
       }
 
-      Object.keys(json.data).forEach((key) => {
-        const item = json.data[key];
-        if (item.url) {
-          updateSlot(key, { status: 'success', resultUrl: item.url, errorMessage: null });
-        } else {
-          updateSlot(key, {
-            status: 'error',
-            resultUrl: null,
-            errorMessage: item.error || '处理失败',
-          });
+      const jobId = submitJson.jobId;
+      const pollInterval = 2000;
+      const maxPolls = 120; // 约 4 分钟
+      let polls = 0;
+
+      const poll = async () => {
+        if (polls >= maxPolls) {
+          withFile.forEach(({ key }) =>
+            updateSlot(key, { status: 'error', resultUrl: null, errorMessage: '处理超时，请重试' })
+          );
+          return;
         }
-      });
+        polls += 1;
+        const statusRes = await fetch(`${API_BASE}/generate-white-background/status/${jobId}`);
+        const statusJson = await statusRes.json().catch(() => ({}));
+
+        if (statusJson.status === 'done' && statusJson.data) {
+          Object.keys(statusJson.data).forEach((key) => {
+            const item = statusJson.data[key];
+            if (item.url) {
+              updateSlot(key, { status: 'success', resultUrl: item.url, errorMessage: null });
+            } else {
+              updateSlot(key, {
+                status: 'error',
+                resultUrl: null,
+                errorMessage: item.error || '处理失败',
+              });
+            }
+          });
+          return;
+        }
+
+        if (statusJson.status === 'error') {
+          const msg = statusJson.error || '处理失败';
+          withFile.forEach(({ key }) =>
+            updateSlot(key, { status: 'error', resultUrl: null, errorMessage: msg })
+          );
+          return;
+        }
+
+        if (statusJson.status === 'not_found' || statusJson.status === 404) {
+          withFile.forEach(({ key }) =>
+            updateSlot(key, { status: 'error', resultUrl: null, errorMessage: '任务已过期或不存在' })
+          );
+          return;
+        }
+
+        await new Promise((r) => setTimeout(r, pollInterval));
+        return poll();
+      };
+
+      await poll();
     } catch (err) {
-      const msg = err.name === 'AbortError' ? '请求超时（通义万相较慢，可重试或检查后端/代理超时）' : (err.message || '网络错误');
+      const msg = err.message || '网络错误';
       withFile.forEach(({ key }) =>
         updateSlot(key, { status: 'error', resultUrl: null, errorMessage: msg })
       );

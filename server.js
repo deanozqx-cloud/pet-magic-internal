@@ -33,7 +33,18 @@ function loadSiliEnv() {
       process.env.ALIYUN_ACCESS_KEY_ID = trimmed.slice('ALIYUN_ACCESS_KEY_ID='.length).trim();
     } else if (trimmed.startsWith('ALIYUN_ACCESS_KEY_SECRET=')) {
       process.env.ALIYUN_ACCESS_KEY_SECRET = trimmed.slice('ALIYUN_ACCESS_KEY_SECRET='.length).trim();
+    } else if (trimmed.startsWith('ALIBABA_CLOUD_ACCESS_KEY_ID=')) {
+      process.env.ALIBABA_CLOUD_ACCESS_KEY_ID = trimmed.slice('ALIBABA_CLOUD_ACCESS_KEY_ID='.length).trim();
+    } else if (trimmed.startsWith('ALIBABA_CLOUD_ACCESS_KEY_SECRET=')) {
+      process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET = trimmed.slice('ALIBABA_CLOUD_ACCESS_KEY_SECRET='.length).trim();
     }
+  }
+  // 兼容：若只配置了 ALIYUN_*，同步到官方要求的 ALIBABA_CLOUD_*
+  if (process.env.ALIYUN_ACCESS_KEY_ID && !process.env.ALIBABA_CLOUD_ACCESS_KEY_ID) {
+    process.env.ALIBABA_CLOUD_ACCESS_KEY_ID = process.env.ALIYUN_ACCESS_KEY_ID;
+  }
+  if (process.env.ALIYUN_ACCESS_KEY_SECRET && !process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET) {
+    process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET = process.env.ALIYUN_ACCESS_KEY_SECRET;
   }
 }
 
@@ -58,18 +69,23 @@ if (process.env.PHOTOROOM_API_KEY) {
   const siliPath = path.join(__dirname, 'sili.env');
   console.warn('未找到 PHOTOROOM_API_KEY。请确认', siliPath, '中有 PHOTOROOM_API_KEY=xxx');
 }
-if (process.env.ALIYUN_ACCESS_KEY_ID && process.env.ALIYUN_ACCESS_KEY_SECRET) {
+const hasAliyunKey = () =>
+  (process.env.ALIBABA_CLOUD_ACCESS_KEY_ID && process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET) ||
+  (process.env.ALIYUN_ACCESS_KEY_ID && process.env.ALIYUN_ACCESS_KEY_SECRET);
+if (hasAliyunKey()) {
   console.log('阿里云通义万相（商品分割）密钥已加载');
 } else {
   loadSiliEnv();
-  if (!process.env.ALIYUN_ACCESS_KEY_ID || !process.env.ALIYUN_ACCESS_KEY_SECRET) {
-    console.warn('未配置 ALIYUN_ACCESS_KEY_ID / ALIYUN_ACCESS_KEY_SECRET，通义万相商品分割不可用');
+  if (!hasAliyunKey()) {
+    console.warn('未配置 ALIYUN_* 或 ALIBABA_CLOUD_ACCESS_KEY_*，通义万相商品分割不可用');
   }
 }
 
 // ========== 依赖引入 ==========
 const express = require('express');
-const ImagesegClient = require('@alicloud/imageseg-2019-12-30');
+const ImagesegClient = require('@alicloud/imageseg20191230');
+const OpenapiClient = require('@alicloud/openapi-client');
+const TeaUtil = require('@alicloud/tea-util');
 const cors = require('cors');
 const multer = require('multer');
 const axios = require('axios');
@@ -199,31 +215,44 @@ async function processSingleImage(fileBuffer, perspective) {
   }
 }
 
-// ========== 阿里云通义万相 商品分割（SegmentCommodity） ==========
+// ========== 阿里云通义万相 商品分割（SegmentCommodity，官方新版 SDK + Advance，临时文件流上传） ==========
 async function processImageByAliyun(fileBuffer, perspective) {
   loadSiliEnv();
-  const accessKeyId = (process.env.ALIYUN_ACCESS_KEY_ID || '').trim();
-  const accessKeySecret = (process.env.ALIYUN_ACCESS_KEY_SECRET || '').trim();
+  const accessKeyId = (process.env.ALIBABA_CLOUD_ACCESS_KEY_ID || process.env.ALIYUN_ACCESS_KEY_ID || '').trim();
+  const accessKeySecret = (process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET || process.env.ALIYUN_ACCESS_KEY_SECRET || '').trim();
   if (!accessKeyId || !accessKeySecret) {
-    return { error: '未配置 ALIYUN_ACCESS_KEY_ID 或 ALIYUN_ACCESS_KEY_SECRET' };
+    return { error: '未配置 ALIBABA_CLOUD_ACCESS_KEY_ID/SECRET 或 ALIYUN_ACCESS_KEY_ID/SECRET' };
   }
+  const readTimeout = parseInt(process.env.ALIYUN_IMAGESEG_READ_TIMEOUT || '60000', 10) || 60000;
+  const connectTimeout = parseInt(process.env.ALIYUN_IMAGESEG_CONNECT_TIMEOUT || '10000', 10) || 10000;
+  let tmpPath = null;
   try {
-    const base64 = fileBuffer.toString('base64');
-    const endpoint = process.env.ALIYUN_IMAGESEG_ENDPOINT || 'imageseg.cn-shanghai.aliyuncs.com';
-    const client = new ImagesegClient({
+    const endpoint = (process.env.ALIYUN_IMAGESEG_ENDPOINT || 'imageseg.cn-shanghai.aliyuncs.com').trim().replace(/^https?:\/\//, '');
+    const config = new OpenapiClient.Config({
       accessKeyId,
       accessKeySecret,
       endpoint,
-      apiVersion: '2019-12-30',
     });
-    // 使用 request 直接传 ImageContent（Base64），避免 SDK 仅校验 ImageURL 的限制
-    const result = await client.request('SegmentCommodity', {
-      ImageContent: base64,
-      ReturnForm: (process.env.ALIYUN_SEGMENT_RETURN_FORM || 'whiteBK').trim(),
+    const client = new ImagesegClient.default(config);
+    const segmentCommodityAdvanceRequest = new ImagesegClient.SegmentCommodityAdvanceRequest();
+    // 使用临时文件 + createReadStream，与官方「本地文件」示例一致，避免 Buffer 流导致请求挂起
+    const uploadDir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+    tmpPath = path.join(uploadDir, `aliyun_seg_${perspective}_${Date.now()}.jpg`);
+    fs.writeFileSync(tmpPath, fileBuffer);
+    segmentCommodityAdvanceRequest.imageURLObject = fs.createReadStream(tmpPath);
+    const returnForm = (process.env.ALIYUN_SEGMENT_RETURN_FORM || 'whiteBK').trim();
+    if (returnForm) segmentCommodityAdvanceRequest.returnForm = returnForm;
+    const runtime = new TeaUtil.RuntimeOptions({
+      readTimeout,
+      connectTimeout,
     });
-    const imageUrl = result?.Data?.ImageURL;
+    console.log('[processImageByAliyun]', perspective, '调用阿里云 SegmentCommodityAdvance...');
+    const response = await client.segmentCommodityAdvance(segmentCommodityAdvanceRequest, runtime);
+    console.log('[processImageByAliyun]', perspective, '阿里云返回成功，拉取结果图...');
+    const imageUrl = response?.body?.data?.imageURL || response?.body?.data?.ImageURL;
     if (!imageUrl || typeof imageUrl !== 'string') {
-      const msg = result?.Message || result?.message || '阿里云未返回图片 URL';
+      const msg = response?.body?.message || '阿里云未返回图片 URL';
       console.error('[processImageByAliyun]', perspective, msg);
       return { error: msg };
     }
@@ -232,12 +261,20 @@ async function processImageByAliyun(fileBuffer, perspective) {
     const url = `data:${contentType};base64,${Buffer.from(imgRes.data).toString('base64')}`;
     return { url };
   } catch (err) {
-    const status = err.response?.status || err.status;
+    const status = err.statusCode || err.response?.status || err.status;
     const code = err.code || err.data?.Code;
-    const message = err.message || err.data?.Message || err.data?.message || String(err);
+    let message = err.message || err.data?.Message || err.data?.message || String(err);
+    if (message && (message.includes("Unexpected '<'") || message.includes('Unexpected token'))) {
+      console.error('[processImageByAliyun]', perspective, '接口返回非 JSON（多为鉴权/权限/配额或地域错误）');
+      message = '通义万相接口返回异常，请检查：1) 阿里云账号是否开通图像分割服务 2) AccessKey 权限 3) 地域/Endpoint 是否正确';
+    }
     const msg = status ? `[${status}] ${message}` : (code ? `[${code}] ${message}` : message);
     console.error('[processImageByAliyun]', perspective, '失败:', msg);
     return { error: msg.slice(0, 300) };
+  } finally {
+    if (tmpPath && fs.existsSync(tmpPath)) {
+      try { fs.unlinkSync(tmpPath); } catch (e) { console.error('[processImageByAliyun] 删除临时文件失败:', e.message); }
+    }
   }
 }
 
@@ -632,14 +669,20 @@ app.post('/regenerate-single', async function (req, res) {
 });
 
 // ========== 路由：/generate-white-background（四视角白底图，与前端严格一致） ==========
-// OPTIONS 预检，确保 CORS 预检请求返回 200 与正确头
-app.options('/generate-white-background', function (req, res) {
-  res.set('Access-Control-Allow-Origin', req.headers.origin || '*');
+// 为跨域请求统一设置 CORS 头（避免本地/远程前端被拦截）
+function setCorsForWhiteBg(req, res) {
+  const origin = (req.headers.origin || '').trim();
+  res.set('Access-Control-Allow-Origin', origin || '*');
   res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.set('Access-Control-Max-Age', '86400');
+}
+app.options('/generate-white-background', function (req, res) {
+  setCorsForWhiteBg(req, res);
   res.status(204).end();
 });
 app.get('/generate-white-background', function (req, res) {
+  setCorsForWhiteBg(req, res);
   res.status(200).json({
     message: '请使用 POST 请求，并上传 multipart/form-data：front（必填）、left、right、bottom',
     usage: 'POST /generate-white-background with fields: front, left?, right?, bottom?',
@@ -653,6 +696,7 @@ const whiteBgFields = [
   { name: 'bottom', maxCount: 1 },
 ];
 app.post('/generate-white-background', uploadMemory.fields(whiteBgFields), async function (req, res) {
+  setCorsForWhiteBg(req, res);
   try {
     const files = req.files || {};
     const frontFile = Array.isArray(files.front) ? files.front[0] : files.front;

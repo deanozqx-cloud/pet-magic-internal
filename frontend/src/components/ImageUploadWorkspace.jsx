@@ -41,7 +41,7 @@ export default function ImageUploadWorkspace() {
   const [productSpec, setProductSpec] = useState('');
   const [features, setFeatures] = useState('');
   const [sellingPoints, setSellingPoints] = useState('');
-  const [extractEngine, setExtractEngine] = useState('photoroom');
+  const [extractEngine, setExtractEngine] = useState('aliyun');
 
   const updateSlot = useCallback((key, patch) => {
     setSlots((prev) => ({ ...prev, [key]: { ...prev[key], ...patch } }));
@@ -101,10 +101,15 @@ export default function ImageUploadWorkspace() {
       withFile.forEach(({ key }) => form.append(key, slots[key].file));
       form.append('engine', extractEngine);
 
+      // 通义万相可能需 30–60 秒，将超时设为 120 秒避免 408
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 120000);
       const res = await fetch(`${API_BASE}/generate-white-background`, {
         method: 'POST',
         body: form,
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
       const json = await res.json().catch(() => ({}));
 
       if (!res.ok) {
@@ -139,7 +144,7 @@ export default function ImageUploadWorkspace() {
         }
       });
     } catch (err) {
-      const msg = err.message || '网络错误';
+      const msg = err.name === 'AbortError' ? '请求超时（通义万相较慢，可重试或检查后端/代理超时）' : (err.message || '网络错误');
       withFile.forEach(({ key }) =>
         updateSlot(key, { status: 'error', resultUrl: null, errorMessage: msg })
       );
@@ -505,7 +510,7 @@ export default function ImageUploadWorkspace() {
         </main>
       </div>
 
-      {/* Fullscreen 大图 */}
+      {/* Fullscreen 大图模态框 */}
       {fullscreenImage && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4"
@@ -513,19 +518,21 @@ export default function ImageUploadWorkspace() {
           role="button"
           tabIndex={0}
           onKeyDown={(e) => e.key === 'Escape' && setFullscreenImage(null)}
-          aria-label="关闭大图"
+          aria-label="点击背景或按 Esc 关闭"
         >
           <button
             type="button"
-            className="absolute right-4 top-4 rounded-full bg-white/10 p-2 text-white hover:bg-white/20"
+            className="absolute right-4 top-4 z-10 flex items-center gap-2 rounded-lg bg-white px-4 py-2 text-sm font-medium text-gray-800 shadow-lg hover:bg-gray-100"
             onClick={(e) => { e.stopPropagation(); setFullscreenImage(null); }}
+            aria-label="关闭"
           >
-            <X className="h-6 w-6" />
+            <X className="h-5 w-5" />
+            关闭
           </button>
           <img
             src={fullscreenImage.url}
             alt={fullscreenImage.label}
-            className="max-h-full max-w-full object-contain"
+            className="relative z-0 max-h-full max-w-full object-contain"
             onClick={(e) => e.stopPropagation()}
           />
         </div>

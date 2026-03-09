@@ -92,6 +92,8 @@ const multer = require('multer');
 const axios = require('axios');
 const FormData = require('form-data');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+const sharp = require('sharp');
+const COS = require('cos-nodejs-sdk-v5');
 const Database = require('better-sqlite3');
 const db = new Database(path.join(__dirname, 'history.db'));
 
@@ -217,6 +219,12 @@ async function processSingleImage(fileBuffer, perspective) {
 }
 
 // ========== 阿里云通义万相 商品分割（SegmentCommodity，官方新版 SDK + Advance，临时文件流上传） ==========
+function isAliyunRetryableError(err) {
+  const msg = (err && (err.message || err.code || err.data?.Message)) || '';
+  const s = String(msg);
+  return /ConnectTimeout|ReadTimeout|ETIMEDOUT|ECONNRESET|Policy expired|timeout/i.test(s);
+}
+
 async function processImageByAliyun(fileBuffer, perspective) {
   loadSiliEnv();
   const accessKeyId = (process.env.ALIBABA_CLOUD_ACCESS_KEY_ID || process.env.ALIYUN_ACCESS_KEY_ID || '').trim();
@@ -224,59 +232,86 @@ async function processImageByAliyun(fileBuffer, perspective) {
   if (!accessKeyId || !accessKeySecret) {
     return { error: '未配置 ALIBABA_CLOUD_ACCESS_KEY_ID/SECRET 或 ALIYUN_ACCESS_KEY_ID/SECRET' };
   }
-  const readTimeout = parseInt(process.env.ALIYUN_IMAGESEG_READ_TIMEOUT || '60000', 10) || 60000;
-  const connectTimeout = parseInt(process.env.ALIYUN_IMAGESEG_CONNECT_TIMEOUT || '10000', 10) || 10000;
-  let tmpPath = null;
-  try {
-    const endpoint = (process.env.ALIYUN_IMAGESEG_ENDPOINT || 'imageseg.cn-shanghai.aliyuncs.com').trim().replace(/^https?:\/\//, '');
-    const config = new OpenapiClient.Config({
-      accessKeyId,
-      accessKeySecret,
-      endpoint,
-    });
-    const client = new ImagesegClient.default(config);
-    const segmentCommodityAdvanceRequest = new ImagesegClient.SegmentCommodityAdvanceRequest();
-    // 使用临时文件 + createReadStream，与官方「本地文件」示例一致，避免 Buffer 流导致请求挂起
-    const uploadDir = path.join(__dirname, 'uploads');
-    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-    tmpPath = path.join(uploadDir, `aliyun_seg_${perspective}_${Date.now()}.jpg`);
-    fs.writeFileSync(tmpPath, fileBuffer);
-    segmentCommodityAdvanceRequest.imageURLObject = fs.createReadStream(tmpPath);
-    const returnForm = (process.env.ALIYUN_SEGMENT_RETURN_FORM || 'whiteBK').trim();
-    if (returnForm) segmentCommodityAdvanceRequest.returnForm = returnForm;
-    const runtime = new TeaUtil.RuntimeOptions({
-      readTimeout,
-      connectTimeout,
-    });
-    console.log('[processImageByAliyun]', perspective, '调用阿里云 SegmentCommodityAdvance...');
-    const response = await client.segmentCommodityAdvance(segmentCommodityAdvanceRequest, runtime);
-    console.log('[processImageByAliyun]', perspective, '阿里云返回成功，拉取结果图...');
-    const imageUrl = response?.body?.data?.imageURL || response?.body?.data?.ImageURL;
-    if (!imageUrl || typeof imageUrl !== 'string') {
-      const msg = response?.body?.message || '阿里云未返回图片 URL';
-      console.error('[processImageByAliyun]', perspective, msg);
-      return { error: msg };
-    }
-    const imgRes = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 30000 });
-    const contentType = imgRes.headers['content-type'] || 'image/png';
-    const url = `data:${contentType};base64,${Buffer.from(imgRes.data).toString('base64')}`;
-    return { url };
-  } catch (err) {
-    const status = err.statusCode || err.response?.status || err.status;
-    const code = err.code || err.data?.Code;
-    let message = err.message || err.data?.Message || err.data?.message || String(err);
-    if (message && (message.includes("Unexpected '<'") || message.includes('Unexpected token'))) {
-      console.error('[processImageByAliyun]', perspective, '接口返回非 JSON（多为鉴权/权限/配额或地域错误）');
-      message = '通义万相接口返回异常，请检查：1) 阿里云账号是否开通图像分割服务 2) AccessKey 权限 3) 地域/Endpoint 是否正确';
-    }
-    const msg = status ? `[${status}] ${message}` : (code ? `[${code}] ${message}` : message);
-    console.error('[processImageByAliyun]', perspective, '失败:', msg);
-    return { error: msg.slice(0, 300) };
-  } finally {
-    if (tmpPath && fs.existsSync(tmpPath)) {
-      try { fs.unlinkSync(tmpPath); } catch (e) { console.error('[processImageByAliyun] 删除临时文件失败:', e.message); }
+  const readTimeout = parseInt(process.env.ALIYUN_IMAGESEG_READ_TIMEOUT || '120000', 10) || 120000;
+  const connectTimeout = parseInt(process.env.ALIYUN_IMAGESEG_CONNECT_TIMEOUT || '30000', 10) || 30000;
+  const maxAttempts = Math.min(parseInt(process.env.ALIYUN_SEG_MAX_ATTEMPTS || '3', 10) || 3, 5);
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let tmpPath = null;
+    try {
+      const endpoint = (process.env.ALIYUN_IMAGESEG_ENDPOINT || 'imageseg.cn-shanghai.aliyuncs.com').trim().replace(/^https?:\/\//, '');
+      const config = new OpenapiClient.Config({
+        accessKeyId,
+        accessKeySecret,
+        endpoint,
+      });
+      const client = new ImagesegClient.default(config);
+      const segmentCommodityAdvanceRequest = new ImagesegClient.SegmentCommodityAdvanceRequest();
+      const uploadDir = path.join(__dirname, 'uploads');
+      if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+      tmpPath = path.join(uploadDir, `aliyun_seg_${perspective}_${Date.now()}.jpg`);
+      fs.writeFileSync(tmpPath, fileBuffer);
+      segmentCommodityAdvanceRequest.imageURLObject = fs.createReadStream(tmpPath);
+      const returnForm = (process.env.ALIYUN_SEGMENT_RETURN_FORM || 'whiteBK').trim();
+      if (returnForm) segmentCommodityAdvanceRequest.returnForm = returnForm;
+      const runtime = new TeaUtil.RuntimeOptions({ readTimeout, connectTimeout });
+      if (attempt > 1) console.log('[processImageByAliyun]', perspective, `第 ${attempt}/${maxAttempts} 次尝试...`);
+      console.log('[processImageByAliyun]', perspective, '调用阿里云 SegmentCommodityAdvance...');
+      const response = await client.segmentCommodityAdvance(segmentCommodityAdvanceRequest, runtime);
+      console.log('[processImageByAliyun]', perspective, '阿里云返回成功，拉取结果图...');
+      const imageUrl = response?.body?.data?.imageURL || response?.body?.data?.ImageURL;
+      if (!imageUrl || typeof imageUrl !== 'string') {
+        const msg = response?.body?.message || '阿里云未返回图片 URL';
+        console.error('[processImageByAliyun]', perspective, msg);
+        return { error: msg };
+      }
+      const fetchTimeout = parseInt(process.env.ALIYUN_FETCH_IMAGE_TIMEOUT || '60000', 10) || 60000;
+      const https = require('https');
+      const fetchAgent = new https.Agent({ family: 4, keepAlive: true });
+      let imgRes;
+      for (let fa = 1; fa <= 3; fa++) {
+        try {
+          imgRes = await axios.get(imageUrl, {
+            responseType: 'arraybuffer',
+            timeout: fetchTimeout,
+            httpsAgent: fetchAgent,
+          });
+          break;
+        } catch (fetchErr) {
+          const isTimeout = /ConnectTimeout|ETIMEDOUT|timeout/i.test(fetchErr.message || '');
+          if (fa < 3 && isTimeout) {
+            console.warn('[processImageByAliyun]', perspective, `拉取结果图超时，第 ${fa} 次重试...`);
+            await new Promise((r) => setTimeout(r, 3000));
+          } else throw fetchErr;
+        }
+      }
+      const contentType = imgRes.headers['content-type'] || 'image/png';
+      const url = `data:${contentType};base64,${Buffer.from(imgRes.data).toString('base64')}`;
+      return { url };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts && isAliyunRetryableError(err)) {
+        console.warn('[processImageByAliyun]', perspective, err.message || err.code, `，${attempt}/${maxAttempts} 次失败，5s 后重试...`);
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+      const status = err.statusCode || err.response?.status || err.status;
+      const code = err.code || err.data?.Code;
+      let message = err.message || err.data?.Message || err.data?.message || String(err);
+      if (message && (message.includes("Unexpected '<'") || message.includes('Unexpected token'))) {
+        message = '通义万相接口返回异常，请检查：1) 阿里云账号是否开通图像分割服务 2) AccessKey 权限 3) 地域/Endpoint 是否正确';
+      }
+      const msg = status ? `[${status}] ${message}` : (code ? `[${code}] ${message}` : message);
+      console.error('[processImageByAliyun]', perspective, '失败:', msg);
+      return { error: msg.slice(0, 300) };
+    } finally {
+      if (tmpPath && fs.existsSync(tmpPath)) { try { fs.unlinkSync(tmpPath); } catch (e) {} }
     }
   }
+  const err = lastErr || new Error('未知错误');
+  const message = err.message || err.data?.Message || String(err);
+  console.error('[processImageByAliyun]', perspective, '失败:', message);
+  return { error: message.slice(0, 300) };
 }
 
 // ========== 辅助函数 ==========
@@ -737,16 +772,20 @@ app.post('/generate-white-background-async', uploadMemory.fields(whiteBgFields),
       try {
         const tasks = [];
         const keys = [];
-        if (frontFile && frontFile.buffer) { tasks.push(processOne(frontFile.buffer, 'front')); keys.push('front'); }
-        if (leftFile && leftFile.buffer) { tasks.push(processOne(leftFile.buffer, 'left')); keys.push('left'); }
-        if (rightFile && rightFile.buffer) { tasks.push(processOne(rightFile.buffer, 'right')); keys.push('right'); }
-        if (bottomFile && bottomFile.buffer) { tasks.push(processOne(bottomFile.buffer, 'bottom')); keys.push('bottom'); }
+        if (frontFile && frontFile.buffer) { tasks.push(processWithMask(frontFile.buffer, 'front', processOne)); keys.push('front'); }
+        if (leftFile && leftFile.buffer) { tasks.push(processWithMask(leftFile.buffer, 'left', processOne)); keys.push('left'); }
+        if (rightFile && rightFile.buffer) { tasks.push(processWithMask(rightFile.buffer, 'right', processOne)); keys.push('right'); }
+        if (bottomFile && bottomFile.buffer) { tasks.push(processWithMask(bottomFile.buffer, 'bottom', processOne)); keys.push('bottom'); }
         const results = await Promise.all(tasks);
         const data = {};
         keys.forEach((key, i) => {
           const r = results[i];
-          if (r.url) data[key] = { url: r.url };
-          else data[key] = { error: r.error || '处理失败' };
+          if (r.url) {
+            data[key] = { url: r.url };
+            if (r.maskUrl) data[key].maskUrl = r.maskUrl;
+          } else {
+            data[key] = { error: r.error || '处理失败' };
+          }
         });
         const job = whiteBgJobs.get(jobId);
         if (job) { job.status = 'done'; job.data = data; }
@@ -807,16 +846,20 @@ app.post('/generate-white-background', uploadMemory.fields(whiteBgFields), async
 
     const tasks = [];
     const keys = [];
-    if (frontFile && frontFile.buffer) { tasks.push(processOne(frontFile.buffer, 'front')); keys.push('front'); }
-    if (leftFile && leftFile.buffer) { tasks.push(processOne(leftFile.buffer, 'left')); keys.push('left'); }
-    if (rightFile && rightFile.buffer) { tasks.push(processOne(rightFile.buffer, 'right')); keys.push('right'); }
-    if (bottomFile && bottomFile.buffer) { tasks.push(processOne(bottomFile.buffer, 'bottom')); keys.push('bottom'); }
+    if (frontFile && frontFile.buffer) { tasks.push(processWithMask(frontFile.buffer, 'front', processOne)); keys.push('front'); }
+    if (leftFile && leftFile.buffer) { tasks.push(processWithMask(leftFile.buffer, 'left', processOne)); keys.push('left'); }
+    if (rightFile && rightFile.buffer) { tasks.push(processWithMask(rightFile.buffer, 'right', processOne)); keys.push('right'); }
+    if (bottomFile && bottomFile.buffer) { tasks.push(processWithMask(bottomFile.buffer, 'bottom', processOne)); keys.push('bottom'); }
     const results = await Promise.all(tasks);
     const data = {};
     keys.forEach((key, i) => {
       const r = results[i];
-      if (r.url) data[key] = { url: r.url };
-      else data[key] = { error: r.error || '处理失败' };
+      if (r.url) {
+        data[key] = { url: r.url };
+        if (r.maskUrl) data[key].maskUrl = r.maskUrl;
+      } else {
+        data[key] = { error: r.error || '处理失败' };
+      }
     });
     res.json({ success: true, data });
   } catch (err) {
@@ -843,6 +886,75 @@ app.get('/api/proxy-image', async function (req, res) {
     res.status(502).json({ error: '图片代理下载失败：' + err.message });
   }
 });
+
+// ========== 生成 Mask 并上传 COS ==========
+/**
+ * 提取图片 Alpha 通道，反转，模糊，并上传到腾讯云 COS
+ * @param {Buffer} imageBuffer 处理后的去背图片 Buffer
+ * @param {string} fileName 上传到 COS 的文件名
+ * @returns {Promise<string>} 上传成功后的 HTTPS URL
+ */
+async function generateMaskAndUpload(imageBuffer, fileName) {
+  const SecretId = process.env.COS_SECRET_ID || '';
+  const SecretKey = process.env.COS_SECRET_KEY || '';
+  const Bucket = process.env.COS_BUCKET || '';
+  const Region = process.env.COS_REGION || '';
+
+  if (!SecretId || !SecretKey || !Bucket || !Region) {
+    throw new Error('未配置 COS_SECRET_ID, COS_SECRET_KEY, COS_BUCKET 或 COS_REGION');
+  }
+
+  const cos = new COS({ SecretId, SecretKey });
+
+  try {
+    // 图像处理：提取 Alpha，反转（背景变为白色，产品部分变为黑色），高斯模糊 3 像素
+    const maskBuffer = await sharp(imageBuffer)
+      .ensureAlpha()
+      .extractChannel('alpha')
+      .negate()
+      .blur(3)
+      .png()
+      .toBuffer();
+
+    return await new Promise((resolve, reject) => {
+      cos.putObject({
+        Bucket: Bucket,
+        Region: Region,
+        Key: fileName,
+        Body: maskBuffer,
+      }, function(err, data) {
+        if (err) {
+          return reject(err);
+        }
+        // data.Location 默认是不带协议的如: examplebucket-1250000000.cos.ap-guangzhou.myqcloud.com/xxx
+        const url = data.Location.startsWith('http') ? data.Location : `https://${data.Location}`;
+        resolve(url);
+      });
+    });
+  } catch (err) {
+    console.error('[generateMaskAndUpload] 处理或上传失败:', err.message);
+    throw err;
+  }
+}
+
+// 包装器：处理完出图后生成并上传 Mask
+async function processWithMask(fileBuffer, perspective, processOneFunc) {
+  const result = await processOneFunc(fileBuffer, perspective);
+  if (result.url) {
+    const base64Data = result.url.split('base64,')[1];
+    if (base64Data) {
+      try {
+        const outBuffer = Buffer.from(base64Data, 'base64');
+        const fileName = `mask-${Date.now()}-${crypto.randomUUID().slice(0, 8)}-${perspective}.png`;
+        const maskUrl = await generateMaskAndUpload(outBuffer, fileName);
+        result.maskUrl = maskUrl;
+      } catch (e) {
+        console.error(`[${perspective}] 生成并上传 Mask 失败:`, e.message);
+      }
+    }
+  }
+  return result;
+}
 
 // ========== 启动服务器 ==========
 const port = process.env.PORT || 3000;

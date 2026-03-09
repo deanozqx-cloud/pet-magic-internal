@@ -214,7 +214,8 @@ async function processSingleImage(fileBuffer, perspective) {
       else if (typeof body === 'string') message = body.slice(0, 200);
     }
     console.error(`[processSingleImage] ${perspective} 失败:`, status ? `[${status}] ${message}` : message);
-    return { error: status ? `[${status}] ${message}` : message };
+    console.warn(`[processSingleImage] 降级使用阿里云处理...`);
+    return await processImageByAliyun(fileBuffer, perspective);
   }
 }
 
@@ -227,6 +228,20 @@ function isAliyunRetryableError(err) {
 
 async function processImageByAliyun(fileBuffer, perspective) {
   loadSiliEnv();
+  
+  let processBuffer = fileBuffer;
+  try {
+    const metadata = await sharp(fileBuffer).metadata();
+    if (metadata.width > 2000 || metadata.height > 2000) {
+      console.log(`[processImageByAliyun] ${perspective} 图片分辨率过大(${metadata.width}x${metadata.height})，缩小至 2000x2000...`);
+      processBuffer = await sharp(fileBuffer)
+        .resize({ width: 2000, height: 2000, fit: 'inside' })
+        .toBuffer();
+    }
+  } catch (err) {
+    console.warn(`[processImageByAliyun] ${perspective} sharp 检查/调整图片分辨率失败:`, err.message);
+  }
+
   const accessKeyId = (process.env.ALIBABA_CLOUD_ACCESS_KEY_ID || process.env.ALIYUN_ACCESS_KEY_ID || '').trim();
   const accessKeySecret = (process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET || process.env.ALIYUN_ACCESS_KEY_SECRET || '').trim();
   if (!accessKeyId || !accessKeySecret) {
@@ -250,7 +265,7 @@ async function processImageByAliyun(fileBuffer, perspective) {
       const uploadDir = path.join(__dirname, 'uploads');
       if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
       tmpPath = path.join(uploadDir, `aliyun_seg_${perspective}_${Date.now()}.jpg`);
-      fs.writeFileSync(tmpPath, fileBuffer);
+      fs.writeFileSync(tmpPath, processBuffer);
       segmentCommodityAdvanceRequest.imageURLObject = fs.createReadStream(tmpPath);
       const returnForm = (process.env.ALIYUN_SEGMENT_RETURN_FORM || 'whiteBK').trim();
       if (returnForm) segmentCommodityAdvanceRequest.returnForm = returnForm;
@@ -938,23 +953,211 @@ async function generateMaskAndUpload(imageBuffer, fileName) {
 }
 
 // 包装器：处理完出图后生成并上传 Mask
-async function processWithMask(fileBuffer, perspective, processOneFunc) {
-  const result = await processOneFunc(fileBuffer, perspective);
-  if (result.url) {
-    const base64Data = result.url.split('base64,')[1];
-    if (base64Data) {
-      try {
-        const outBuffer = Buffer.from(base64Data, 'base64');
-        const fileName = `mask-${Date.now()}-${crypto.randomUUID().slice(0, 8)}-${perspective}.png`;
-        const maskUrl = await generateMaskAndUpload(outBuffer, fileName);
-        result.maskUrl = maskUrl;
-      } catch (e) {
-        console.error(`[${perspective}] 生成并上传 Mask 失败:`, e.message);
-      }
+async function getTransparentPngByPhotoroom(fileBuffer, perspective) {
+  const apiKey = (process.env.PHOTOROOM_API_KEY || '').trim().replace(/\s+/g, '');
+  if (!apiKey) throw new Error('未配置 PHOTOROOM_API_KEY，无法获取透明 PNG');
+  
+  const form = new FormData();
+  const ext = (process.env.PHOTOROOM_IMAGE_EXT || 'jpg').toLowerCase().replace(/^\./, '');
+  const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
+  form.append('image_file', fileBuffer, { filename: `product-${perspective}.${ext}`, contentType: mime });
+  form.append('size', (process.env.PHOTOROOM_SIZE || 'full').trim());
+  if (process.env.PHOTOROOM_CROP === 'true') form.append('crop', 'true');
+  form.append('format', 'png'); // 关键：不传 bg_color，指定 format 为 png 即可获取透明背景图
+  
+  const agent = getPhotoroomAgent();
+  const axiosConfig = {
+    headers: { 'x-api-key': apiKey, ...form.getHeaders() },
+    responseType: 'arraybuffer',
+    timeout: parseInt(process.env.PHOTOROOM_TIMEOUT_MS || '120000', 10) || 120000,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+  };
+  if (agent) axiosConfig.httpsAgent = agent;
+  
+  const response = await axios.post(`${PHOTOROOM_BASE}/v1/segment`, form, axiosConfig);
+  return Buffer.from(response.data);
+}
+
+async function getTransparentPngByAliyun(fileBuffer, perspective) {
+  let processBuffer = fileBuffer;
+  try {
+    const metadata = await sharp(fileBuffer).metadata();
+    // 阿里云要求长宽小于等于2000，否则返回 400 imageOversized
+    if (metadata.width > 2000 || metadata.height > 2000) {
+      console.log(`[${perspective}] 图片分辨率过大(${metadata.width}x${metadata.height})，缩小至 2000x2000...`);
+      processBuffer = await sharp(fileBuffer)
+        .resize({ width: 2000, height: 2000, fit: 'inside' })
+        .toBuffer();
+    }
+  } catch (err) {
+    console.warn(`[${perspective}] sharp 检查/调整图片分辨率失败:`, err.message);
+  }
+
+  const accessKeyId = (process.env.ALIBABA_CLOUD_ACCESS_KEY_ID || process.env.ALIYUN_ACCESS_KEY_ID || '').trim();
+  const accessKeySecret = (process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET || process.env.ALIYUN_ACCESS_KEY_SECRET || '').trim();
+  if (!accessKeyId || !accessKeySecret) {
+    throw new Error('未配置 ALIYUN_ACCESS_KEY_ID/SECRET');
+  }
+
+  const endpoint = (process.env.ALIYUN_IMAGESEG_ENDPOINT || 'imageseg.cn-shanghai.aliyuncs.com').trim().replace(/^https?:\/\//, '');
+  const config = new OpenapiClient.Config({ accessKeyId, accessKeySecret, endpoint });
+  const client = new ImagesegClient.default(config);
+  
+  const uploadDir = path.join(__dirname, 'uploads');
+  if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+  const tmpPath = path.join(uploadDir, `aliyun_trans_${perspective}_${Date.now()}.jpg`);
+  fs.writeFileSync(tmpPath, processBuffer);
+
+  try {
+    const request = new ImagesegClient.SegmentCommodityAdvanceRequest();
+    request.imageURLObject = fs.createReadStream(tmpPath);
+    // 关键：指定 returnForm 为 crop，获取透明背景的 PNG
+    request.returnForm = 'crop';
+    
+    const runtime = new TeaUtil.RuntimeOptions({ readTimeout: 120000, connectTimeout: 30000 });
+    const response = await client.segmentCommodityAdvance(request, runtime);
+    
+    const imageUrl = response?.body?.data?.imageURL || response?.body?.data?.ImageURL;
+    if (!imageUrl || typeof imageUrl !== 'string') {
+      throw new Error(response?.body?.message || '阿里云未返回图片 URL');
+    }
+    
+    const fetchAgent = new (require('https').Agent)({ family: 4, keepAlive: true });
+    const imgRes = await axios.get(imageUrl, {
+      responseType: 'arraybuffer',
+      timeout: 60000,
+      httpsAgent: fetchAgent,
+    });
+    return Buffer.from(imgRes.data);
+  } finally {
+    if (fs.existsSync(tmpPath)) {
+      try { fs.unlinkSync(tmpPath); } catch (e) {}
     }
   }
-  return result;
 }
+
+// 获取透明图兜底：先通义万相，失败再 Photoroom
+async function getTransparentPng(fileBuffer, perspective) {
+  try {
+    return await getTransparentPngByAliyun(fileBuffer, perspective);
+  } catch (err) {
+    console.warn(`[${perspective}] 通义万相提取透明 PNG 失败(${err.message})，降级使用 Photoroom...`);
+    return await getTransparentPngByPhotoroom(fileBuffer, perspective);
+  }
+}
+
+async function processWithMask(fileBuffer, perspective, processOneFunc) {
+  // 并行执行主任务(原白底图逻辑) 和 附加任务(调用通义万相/Photoroom 获取透明图并生成 Mask)
+  const [resultPromise, maskPromise] = await Promise.allSettled([
+    processOneFunc(fileBuffer, perspective),
+    (async () => {
+      // 1. 调用通义万相获取透明 PNG，失败则兜底 Photoroom
+      const transparentBuffer = await getTransparentPng(fileBuffer, perspective);
+      // 2. 对这张透明 PNG 运行 generateMaskAndUpload 逻辑
+      const fileName = `mask-${Date.now()}-${crypto.randomUUID().slice(0, 8)}-${perspective}.png`;
+      return await generateMaskAndUpload(transparentBuffer, fileName);
+    })()
+  ]);
+
+  const finalResult = resultPromise.status === 'fulfilled' ? resultPromise.value : { error: resultPromise.reason?.message || '处理失败' };
+  
+  if (finalResult.url && maskPromise.status === 'fulfilled') {
+    finalResult.maskUrl = maskPromise.value;
+  } else if (maskPromise.status === 'rejected') {
+    console.error(`[${perspective}] 生成并上传 Mask 失败:`, maskPromise.reason?.message);
+  }
+  
+  return finalResult;
+}
+
+/**
+ * 上传原图与遮罩图至 COS（并发）
+ * @param {Buffer} originalBuffer 原图 Buffer
+ * @param {Buffer} maskBuffer 遮罩图 Buffer
+ * @returns {Promise<{originalUrl: string, maskUrl: string}>}
+ */
+async function uploadOriginalAndMask(originalBuffer, maskBuffer) {
+  const SecretId = process.env.COS_SECRET_ID || '';
+  const SecretKey = process.env.COS_SECRET_KEY || '';
+  const Bucket = process.env.COS_BUCKET || '';
+  const Region = process.env.COS_REGION || '';
+
+  if (!SecretId || !SecretKey || !Bucket || !Region) {
+    throw new Error('未配置 COS_SECRET_ID, COS_SECRET_KEY, COS_BUCKET 或 COS_REGION');
+  }
+
+  const cos = new COS({ SecretId, SecretKey });
+
+  const ts = Date.now();
+  const originalFileName = `products/${ts}-orig.png`;
+  const maskFileName = `masks/${ts}-mask.png`;
+
+  const uploadFile = (fileName, fileBuffer) => {
+    return new Promise((resolve, reject) => {
+      cos.putObject({
+        Bucket: Bucket,
+        Region: Region,
+        Key: fileName,
+        Body: fileBuffer,
+      }, function(err, data) {
+        if (err) return reject(err);
+        const url = data.Location.startsWith('http') ? data.Location : `https://${data.Location}`;
+        resolve(url);
+      });
+    });
+  };
+
+  try {
+    const [originalUrl, maskUrl] = await Promise.all([
+      uploadFile(originalFileName, originalBuffer),
+      uploadFile(maskFileName, maskBuffer)
+    ]);
+    return { originalUrl, maskUrl };
+  } catch (err) {
+    console.error('[uploadOriginalAndMask] 并发上传失败:', err.message);
+    throw err;
+  }
+}
+
+// ========== 路由：演示 uploadOriginalAndMask 集成 ==========
+app.post('/api/upload-product-with-mask', uploadMemory.single('image'), async (req, res) => {
+  setCorsForWhiteBg(req, res); // 复用之前的跨域处理
+  try {
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ success: false, message: '请上传图片 (字段名: image)' });
+    }
+    
+    // 1. 获取原图 Buffer
+    const originalBuffer = req.file.buffer;
+    
+    // 2. 提取透明PNG (优先通义万相抠图，失败则 Photoroom 提取)
+    const transparentBuffer = await getTransparentPng(originalBuffer, 'front');
+    
+    // 3. 使用 sharp 对透明 PNG 生成 Mask (提取 Alpha -> 反转 -> 模糊3像素)
+    const maskBuffer = await sharp(transparentBuffer)
+      .ensureAlpha()
+      .extractChannel('alpha')
+      .negate()
+      .blur(3)
+      .png()
+      .toBuffer();
+      
+    // 4. 并发上传原图和 Mask 图到 COS
+    const { originalUrl, maskUrl } = await uploadOriginalAndMask(originalBuffer, maskBuffer);
+    
+    res.json({
+      success: true,
+      data: {
+        originalUrl,
+        maskUrl
+      }
+    });
+  } catch (err) {
+    console.error('[/api/upload-product-with-mask] 接口异常:', err.message);
+    res.status(500).json({ success: false, message: '服务异常：' + (err.message || '未知错误') });
+  }
+});
 
 // ========== 启动服务器 ==========
 const port = process.env.PORT || 3000;

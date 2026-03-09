@@ -122,21 +122,17 @@ app.use(cors({ origin: true, methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'
 app.use(express.json({ limit: '2mb' }));
 
 // 静态文件
-const rootIndexPath = path.join(__dirname, 'index.html');
-const fallbackFrontendRoot = path.resolve(__dirname, 'my_first_app');
-const fallbackIndexPath = path.join(fallbackFrontendRoot, 'index.html');
+const frontendDistPath = path.join(__dirname, 'frontend', 'dist');
+const fallbackIndexPath = path.join(frontendDistPath, 'index.html');
 
 app.get('/', function (req, res) {
-  const useRoot = fs.existsSync(rootIndexPath);
-  const indexPath = useRoot ? rootIndexPath : fallbackIndexPath;
-  const root = useRoot ? __dirname : fallbackFrontendRoot;
-  if (!fs.existsSync(indexPath)) {
-    res.status(500).send('首页文件未找到');
+  if (!fs.existsSync(fallbackIndexPath)) {
+    res.status(500).send('前端未构建，请先在 frontend 目录下执行 npm run build');
     return;
   }
-  res.sendFile(path.basename(indexPath), { root });
+  res.sendFile('index.html', { root: frontendDistPath });
 });
-app.use(express.static(fallbackFrontendRoot));
+app.use(express.static(frontendDistPath));
 
 // ========== 上传目录 & Multer ==========
 const uploadDir = path.join(__dirname, 'uploads');
@@ -1009,32 +1005,69 @@ async function getTransparentPngByAliyun(fileBuffer, perspective) {
   const tmpPath = path.join(uploadDir, `aliyun_trans_${perspective}_${Date.now()}.jpg`);
   fs.writeFileSync(tmpPath, processBuffer);
 
-  try {
-    const request = new ImagesegClient.SegmentCommodityAdvanceRequest();
-    request.imageURLObject = fs.createReadStream(tmpPath);
-    // 关键：指定 returnForm 为 crop，获取透明背景的 PNG
-    request.returnForm = 'crop';
-    
-    const runtime = new TeaUtil.RuntimeOptions({ readTimeout: 120000, connectTimeout: 30000 });
-    const response = await client.segmentCommodityAdvance(request, runtime);
-    
-    const imageUrl = response?.body?.data?.imageURL || response?.body?.data?.ImageURL;
-    if (!imageUrl || typeof imageUrl !== 'string') {
-      throw new Error(response?.body?.message || '阿里云未返回图片 URL');
-    }
-    
-    const fetchAgent = new (require('https').Agent)({ family: 4, keepAlive: true });
-    const imgRes = await axios.get(imageUrl, {
-      responseType: 'arraybuffer',
-      timeout: 60000,
-      httpsAgent: fetchAgent,
-    });
-    return Buffer.from(imgRes.data);
-  } finally {
-    if (fs.existsSync(tmpPath)) {
-      try { fs.unlinkSync(tmpPath); } catch (e) {}
+  const maxAttempts = Math.min(parseInt(process.env.ALIYUN_SEG_MAX_ATTEMPTS || '3', 10) || 3, 5);
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const request = new ImagesegClient.SegmentCommodityAdvanceRequest();
+      request.imageURLObject = fs.createReadStream(tmpPath);
+      // 关键：指定 returnForm 为 crop，获取透明背景的 PNG
+      request.returnForm = 'crop';
+      
+      const runtime = new TeaUtil.RuntimeOptions({ readTimeout: 120000, connectTimeout: 30000 });
+      // 对获取透明图的请求打印更详细的日志
+      if (attempt > 1) console.log(`[getTransparentPngByAliyun] ${perspective} 第 ${attempt}/${maxAttempts} 次尝试...`);
+      console.log(`[getTransparentPngByAliyun] ${perspective} 调用阿里云 SegmentCommodityAdvance...`);
+      const response = await client.segmentCommodityAdvance(request, runtime);
+      console.log(`[getTransparentPngByAliyun] ${perspective} 阿里云返回成功，准备拉取结果...`);
+      
+      const imageUrl = response?.body?.data?.imageURL || response?.body?.data?.ImageURL;
+      if (!imageUrl || typeof imageUrl !== 'string') {
+        throw new Error(response?.body?.message || '阿里云未返回图片 URL');
+      }
+      
+      let imgRes;
+      let axiosError;
+      const fetchAgent = new (require('https').Agent)({ family: 4, keepAlive: true });
+      for (let fa = 1; fa <= 3; fa++) {
+        try {
+          console.log(`[getTransparentPngByAliyun] ${perspective} 开始拉取结果图, 尝试 ${fa}/3`);
+          imgRes = await axios.get(imageUrl, {
+            responseType: 'arraybuffer',
+            timeout: 60000,
+            httpsAgent: fetchAgent,
+          });
+          break;
+        } catch (fetchErr) {
+          axiosError = fetchErr;
+          const isTimeout = /ConnectTimeout|ETIMEDOUT|timeout/i.test(fetchErr.message || '');
+          if (fa < 3 && isTimeout) {
+            console.warn(`[getTransparentPngByAliyun] ${perspective} 拉取结果图超时，第 ${fa} 次重试...`);
+            await new Promise((r) => setTimeout(r, 3000));
+          } else {
+            console.error(`[getTransparentPngByAliyun] ${perspective} 拉取结果图失败: ${fetchErr.message}`);
+            throw fetchErr;
+          }
+        }
+      }
+      if (!imgRes) {
+         throw axiosError || new Error('拉取图片失败');
+      }
+      return Buffer.from(imgRes.data);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts && isAliyunRetryableError(err)) {
+        console.warn(`[getTransparentPngByAliyun] ${perspective} ${err.message || err.code}，${attempt}/${maxAttempts} 次失败，5s 后重试...`);
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+      throw err;
     }
   }
+  if (tmpPath && fs.existsSync(tmpPath)) {
+    try { fs.unlinkSync(tmpPath); } catch (e) {}
+  }
+  throw lastErr;
 }
 
 // 获取透明图兜底：先通义万相，失败再 Photoroom
